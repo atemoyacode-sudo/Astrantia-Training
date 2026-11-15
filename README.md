@@ -116,7 +116,7 @@ design and its rule were written before the run. The log is not in this reposito
 
 Kaggle (2x T4, CPU), Google Colab (one G4 GPU, 96 GB), and a Mac with 32 GB for MLX evaluation. Paths in the
 scripts follow that layout (`/kaggle/input`, `/content`, a local `cache/`), and Kaggle / Hugging Face account names
-are written as `<kaggle-user>` and `<hf-user>`.
+are written as `<kaggle-user>`.
 
 ## License
 
