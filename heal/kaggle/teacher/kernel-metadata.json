@@ -1,0 +1,4 @@
+{"id": "<kaggle-user>/xmodel-heal-teacher", "title": "xmodel-heal-teacher", "code_file": "run.py",
+ "language": "python", "kernel_type": "script", "is_private": true, "enable_gpu": true, "enable_tpu": false,
+ "enable_internet": true, "dataset_sources": ["<kaggle-user>/xmodel-heal-inputs", "<kaggle-user>/llama-cpp-bin"],
+ "kernel_sources": [], "competition_sources": [], "model_sources": [], "machine_shape": "NvidiaTeslaT4"}

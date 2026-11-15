@@ -1,0 +1,2 @@
+{"task": "sci", "id": "ja-00", "answer": "-", "category": "ja_sample", "prompt": "雨の日に家で楽しめる過ごし方を3つ、それぞれ理由と一緒に教えてください。", "order": 0, "bench_order": 0}
+{"task": "sci", "id": "ja-01", "answer": "-", "category": "ja_sample", "prompt": "りんごが3個ずつ入った袋が4つあります。そこから5個食べると、残りは何個ですか？考え方も説明してください。", "order": 1, "bench_order": 1}

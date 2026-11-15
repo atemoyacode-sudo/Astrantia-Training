@@ -1,0 +1,4 @@
+{"id": "<kaggle-user>/xmodel-heal-student-uneven", "title": "xmodel-heal-student-uneven", "code_file": "run.py",
+ "language": "python", "kernel_type": "script", "is_private": true, "enable_gpu": false, "enable_tpu": false,
+ "enable_internet": true, "dataset_sources": ["<kaggle-user>/xmodel-heal-inputs"],
+ "kernel_sources": [], "competition_sources": [], "model_sources": []}

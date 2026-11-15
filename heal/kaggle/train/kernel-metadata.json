@@ -1,0 +1,22 @@
+{
+ "id": "<kaggle-user>/xmodel-heal-train",
+ "title": "xmodel-heal-train",
+ "code_file": "run.py",
+ "language": "python",
+ "kernel_type": "script",
+ "is_private": true,
+ "enable_gpu": true,
+ "enable_tpu": false,
+ "enable_internet": true,
+ "dataset_sources": [
+  "<kaggle-user>/xmodel-heal-inputs",
+  "<kaggle-user>/xmodel-heal-state"
+ ],
+ "kernel_sources": [
+  "<kaggle-user>/xmodel-heal-student",
+  "<kaggle-user>/xmodel-heal-teacher"
+ ],
+ "competition_sources": [],
+ "model_sources": [],
+ "machine_shape": "NvidiaTeslaT4"
+}

@@ -1,0 +1,52 @@
+{
+ "_note": "G4 bf16, thinking on, 32k (README 15); IFEval of the 9B models pending on Kaggle; the 35B original running",
+ "source": "One Colab G4, vLLM 0.33, bf16, thinking on, up to 32,768 tokens, one sample per question (AIME: 3). Reduced sets: MMLU-Pro 280 of 12,032; LiveCodeBench v6 = the 175 problems added in v6.",
+ "models": [
+  "Astrantia (9.4B)",
+  "NeoHorse-1-9B",
+  "Qwen3.5-9B"
+ ],
+ "panels": [
+  {
+   "title": "AIME 2026",
+   "sub": "30 problems, mean of 3 samples",
+   "of": 30,
+   "values": [
+    20.7,
+    20.3,
+    22.3
+   ]
+  },
+  {
+   "title": "MMLU-Pro",
+   "sub": "280 questions (20 per subject), knowledge",
+   "of": 280,
+   "values": [
+    144,
+    221,
+    226
+   ]
+  },
+  {
+   "title": "LiveCodeBench v6",
+   "sub": "175 problems, all tests must pass",
+   "of": 175,
+   "values": [
+    68,
+    96,
+    87
+   ]
+  },
+  {
+   "title": "Made-up things described",
+   "sub": "of 40 that do not exist (lower is better; Mac 4-bit)",
+   "of": 40,
+   "values": [
+    25,
+    null,
+    17
+   ],
+   "lower_better": true
+  }
+ ]
+}
