@@ -110,7 +110,7 @@ The benchmark sets themselves (MMLU-Pro, MATH-500, HumanEval, AIME 2026, LiveCod
 scripts from their public sources and are not redistributed here.
 
 Comments in the scripts refer to sections of the project's research log ("README 13", "README 15", ...), where each
-design and its rule were written before the run. The log is not in this repository yet.
+design and its rule were written before the run: [`docs/research_log.md`](docs/research_log.md) (with the dead ends).
 
 ## Hardware it ran on
 
