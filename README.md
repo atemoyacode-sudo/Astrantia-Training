@@ -119,7 +119,7 @@ are written as `<kaggle-user>` and `<hf-user>`.
 
 ## License
 
-Code: [Apache-2.0 / to be chosen] (`LICENSE`). The released weights are derived from Qwen3.5-35B-A3B (Apache-2.0).
+Code: Apache-2.0 (`LICENSE`). The released weights are derived from Qwen3.5-35B-A3B (Apache-2.0).
 
 ---
 
