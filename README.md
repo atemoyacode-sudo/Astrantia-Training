@@ -6,7 +6,8 @@ about 15M tokens of LoRA training. Not an official Qwen model.
 
 The question behind it: **can a model of any chosen size be made from a large one by cutting it and healing it a
 little?** And when it can, **what gets weaker?** The weights, the benchmark numbers and the known weak points are on
-the model card: `<hf-user>/Sharpen-Qwen-3.5-9B-A2.6B-Preview` (and `-padded` for vLLM / transformers).
+the model card: [Takenoko12345678/Sharpen-Qwen-3.5-9B-A2.6B-Preview](https://huggingface.co/Takenoko12345678/Sharpen-Qwen-3.5-9B-A2.6B-Preview)
+(and [`-padded`](https://huggingface.co/Takenoko12345678/Sharpen-Qwen-3.5-9B-A2.6B-Preview-padded) for vLLM / transformers).
 
 This repository holds the code of the pipeline that produced the released model, separated from the earlier
 experiments. It does not hold the training data or the weights (see "Data" below).

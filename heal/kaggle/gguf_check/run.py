@@ -7,7 +7,7 @@ def sh(c, check=True):
 sh("nproc; free -g")
 sh(f"{sys.executable} -m pip install -q 'huggingface_hub==1.33.0' hf_xet 2>&1 | tail -1")
 from huggingface_hub import hf_hub_download
-q4 = hf_hub_download(os.environ.get("HF_REPO", "<hf-user>/Sharpen-Qwen-3.5-9B-A2.6B-Preview"), "Sharpen-Qwen-3.5-9B-A2.6B-Preview-Q4_K_M.gguf", local_dir="/tmp/g")
+q4 = hf_hub_download(os.environ.get("HF_REPO", "Takenoko12345678/Sharpen-Qwen-3.5-9B-A2.6B-Preview"), "Sharpen-Qwen-3.5-9B-A2.6B-Preview-Q4_K_M.gguf", local_dir="/tmp/g")
 sh("git clone -q --depth 1 https://github.com/ggml-org/llama.cpp /tmp/llama.cpp && cd /tmp/llama.cpp && git log -1 --format='%h %cd'")
 sh("cd /tmp/llama.cpp && cmake -B build -DGGML_NATIVE=ON -DLLAMA_CURL=OFF > /dev/null && cmake --build build -j$(nproc) 2>&1 | tail -1")
 sh("ls /tmp/llama.cpp/build/bin | head -60 | tr '\\n' ' '")
