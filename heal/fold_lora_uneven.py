@@ -1,6 +1,7 @@
 """Fold a heal_train.py LoRA into an uneven student checkpoint, in place (README 14: the released weights).
 
-The routed experts (uneven_*.safetensors) are not LoRA targets and stay as they are. The attention, Gated DeltaNet and
+The routed experts (uneven_*.safetensors) stay as they are, unless the LoRA carries README 26 B's down_proj update
+(keys ...mlp.experts.lora_A / lora_B): then each layer's `down` gets uneven.down_lora_delta. The attention, Gated DeltaNet and
 shared-expert linears get W += scale * B @ A with scale = alpha / r = 2, as in heal_train.add_lora and
 pad_uneven.fold_lora. Works shard by shard on the CPU (no model load), so it needs little memory.
 
@@ -27,6 +28,7 @@ def main() -> None:
     d = Path(args.student)
     st = torch.load(args.lora, map_location="cpu", weights_only=False)
     st = st.get("lora", st)
+    expert = {k: st.pop(k) for k in [k for k in st if ".mlp.experts.lora_" in k]}
     mods = sorted(k[:-2] for k in st if k.endswith(".A"))
     assert len(mods) * 2 == len(st) and all(m + ".B" in st for m in mods), "unexpected LoRA keys"
     wmap = json.loads((d / "model.safetensors.index.json").read_text())["weight_map"]
@@ -50,7 +52,32 @@ def main() -> None:
             t[key_of[m]] = new.contiguous()
         save_file(t, d / fname, metadata={"format": "pt"})
         print(f"{fname}: folded {len(ms)}", flush=True)
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "moe"))
+    from uneven import down_lora_delta
+
+    ex_rel = []
+    layers = sorted({int(k.split(".layers.")[1].split(".")[0]) for k in expert})
+    for i in layers:
+        pre = next(k for k in expert if f".layers.{i}.mlp.experts.lora_A" in k)[: -len("lora_A")]
+        a, b = expert[pre + "lora_A"], expert[pre + "lora_B"]
+        f = d / f"uneven_{i:03d}.safetensors"
+        t = load_file(f)
+        widths = [int(w) for w in t["widths"]]
+        assert a.shape[1] == sum(widths) and b.shape[0] == len(widths), f"layer {i}: expert LoRA does not match the widths"
+        delta = down_lora_delta(a, b, widths, args.scale)
+        w = t["down"]
+        new = (w.float() + delta).to(w.dtype)
+        ex_rel.append(float((new.float() - w.float()).norm() / w.float().norm().clamp_min(1e-12)))
+        t["down"] = new.contiguous()
+        save_file(t, f, metadata={"format": "pt"})
+    if layers:
+        print(f"expert down_proj LoRA folded into {len(layers)} layers", flush=True)
+    rel = rel or [0.0]
     out = {"lora": Path(args.lora).name, "folded": len(mods), "files": len(by_file), "scale": args.scale,
+           "expert_layers_folded": len(layers),
+           "expert_relative_change_max": max(ex_rel) if ex_rel else 0.0,
            "relative_change_mean": sum(rel) / len(rel), "relative_change_max": max(rel)}
     (d / "fold_check.json").write_text(json.dumps(out, indent=1))
     print(json.dumps(out), flush=True)

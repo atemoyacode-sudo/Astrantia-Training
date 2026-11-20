@@ -2144,6 +2144,1061 @@ LiveCodeBench v6. `bench/ext_bench.py` (11-13) has the sets; `bench/colab_ext.sh
     original 108, Qwen3.5-9B 105, NeoHorse 104, wikil-a 78.
   - GGUF Q4_K_M (10.6 GB) in the main repo, checked with llama.cpp on a CPU on three prompts (all sensible).
 
+## 16. Merging instead of cutting, on the Mac (design written 2026-11-16 03:10, before any run; `moe/merge_uneven.py`)
+
+The author wants the most effective merge, researched on the Mac. Since the release, the cut `g128b28160` keeps the
+28,160 most important neurons per layer among the top 128 experts and drops the rest. Here the dropped neurons and
+experts are folded into the kept ones instead, at exactly the same size (9.4B), with no training.
+
+- **What failed before** (11-08, 48 of 256 experts): averaging whole experts' weights tripled KL; least squares on
+  `down` cut each layer's error by 17% but the final KL by only 0.5%. Two differences now: (1) most of what this cut
+  drops is neurons inside kept experts, which the kept neurons of the same expert can stand in for; (2) the earlier
+  fit used the original's inputs, so the error the cut model builds up over the layers was never corrected.
+- **Variants** (all from the same kept neurons and router rows; only `down` of the kept neurons changes):
+  - `ref`: `g128b28160` as released (KL 0.155 in 6h; it is recomputed here as the reference).
+  - `nm` (neuron merge): every dropped neuron of a kept expert is folded into the kept neuron of that expert whose
+    activation it follows most closely on the calibration tokens: `down_k += a * down_d`, with `a` the regression
+    coefficient of the dropped activation on the kept one.
+  - `elsq` (expert-local least squares): every kept expert's `down` is refitted so that its kept neurons reproduce
+    the expert's full output (all 512 neurons) on the tokens routed to it, weighted by the routing weight; ridge
+    towards the current `down`.
+  - `jlsq` (joint least squares): all kept neurons of a layer together are refitted so that the cut MoE block, with
+    its own routing, reproduces the original block's routed output. This can also stand in for dropped experts.
+  - `jlsq_s` (joint, sequential): as `jlsq`, but the inputs are the cut model's own calibration stream (its own
+    errors so far) and the target is the original block's output at the same positions.
+  - The ridge strength is chosen per layer on the 20 calibration windows not used for the fit (`C` beyond the first
+    100), never on the held-out windows A and B.
+- **Measure**: KL to the original on the same 60 held-out chat windows (A, B), Mac MPS float32, one layer-by-layer
+  pass for all variants (`moe/width_pass.py`'s machinery).
+- **Rule**: a variant works if it closes at least 10% of the gap between `ref` and the original (`closed`, as in the
+  11-08 test) with the 95% bootstrap interval above 0. The working variant with the lowest KL goes on; the next step
+  (build it, put wikil-a's LoRA on it, then facts and MMLU-Pro on the Mac against the release) gets its own rule
+  before it runs. If none works, router calibration and a shared basis across experts are the next candidates.
+- Nothing is saved but the results; no model is built in this pass.
+
+### Result (11-16 20:06 – 11-17 00:30, Mac MPS float32; `cache/merge16/results.json`)
+
+| variant | KL A+B | gap to `ref` closed [95%] | MoE block error (val, mean over layers) |
+|---|---:|---:|---:|
+| original (`full`, check) | 0.0016 | – | – |
+| `ref` (the cut as released) | 0.1545 | – | 0.432 |
+| `nm` (neuron merge) | 0.1543 | +0.1% [−0.7, +0.9] | 0.431 |
+| `elsq` (expert-local) | 0.1516 | +1.9% [+0.8, +2.9] | 0.426 |
+| `jlsq` (joint) | **0.1491** | **+3.5% [+2.3, +4.9]** | 0.413 |
+| `jlsq_s` (joint, own stream) | 0.1522 | +1.5% [−0.0, +3.1] | 0.419 |
+
+- `ref` reproduces 6h's 0.155, so the pass is sound.
+- **By the rule (at least 10%), no variant works.** The joint fit is the best and its gain is real (the interval is
+  well above 0), but it closes 3.5% of the gap, a third of what the rule asks.
+- The same pattern as on 11-08: the block's own error falls more (0.432 → 0.413, about 4%, and about 20% in layer
+  1) than the final KL does. What the kept neurons can stand in for, linearly, is a small part of what was dropped.
+- Folding a dropped neuron into its closest kept neuron (`nm`) does nothing: within an expert the neurons do not
+  duplicate each other.
+- Fitting on the cut model's own stream (`jlsq_s`) is worse than on the original's, the opposite of the hope: the
+  target at later layers (the original's output) is far from anything its own drifted inputs can reach, so the fit
+  spends itself on the drift.
+- Ran with a checkpoint every 4 layers; the memory guard stopped it four times (process at 22-27 GB, or the Mac at
+  7% free with other apps open) and it resumed each time.
+- Next, as written above: router calibration, then a shared basis across experts. `jlsq` can be stacked on either.
+
+## 17. Router calibration, layer by layer (design written 2026-11-17 00:50, before any run; `moe/merge_uneven.py`)
+
+The author's standing instruction (11-17): try many methods small, and train what looks worth it, without asking.
+Section 16's merges closed at most 3.5%. The paper the author pointed to (arXiv 2603.02217) puts most of the loss
+after an MoE cut on the router no longer fitting the changed experts, more so for fine-grained MoEs like this one.
+
+- **Method** (`rcal`): at every layer, only the router rows of the kept experts are trained, by gradient, so that
+  the cut MoE block (its own top-8 routing and renormalised weights) reproduces the original block's output on the
+  calibration inputs. Adam, minibatches of 2,048 tokens of the first 100 calibration windows; the step count is
+  chosen by the block error on the other 20 windows (checked every 50 steps, at most 400). Experts are not touched.
+- **Variants**: `ref`, `jlsq` (section 16's best), `rcal`, and `jlsq_rcal` (the down refit first, then the router).
+- **Measure and rule**: as section 16 (KL on A and B; a variant works if it closes at least 10% of `ref`'s gap with
+  the 95% interval above 0).
+- **If one works**: it is built as a model (the uneven checkpoint with the new router rows and down), wikil-a's LoRA
+  is put on it, and on the Mac (4-bit) it answers the facts probes and MMLU-Pro (thinking off, 2,048) against the
+  release. Kept if facts' wrong share is not higher by more than 0.03 and MMLU-Pro is not lower by a paired sign test
+  (p < 0.05); then a short LoRA heal on top is the next run.
+- **If none works**: a router trained against the original's final output (Router KD proper, end to end) is next,
+  on the GPU when one is available.
+- **Result (11-17 00:20-00:50; only layer 1 was run, then stopped):** on layer 1 the block error went from 0.456 to
+  0.435 (400 steps, rate 1e-4) or 0.433 (200 steps, rate 1e-3), about 5%, against 21% for `jlsq` on the same layer;
+  `jlsq_rcal` 0.355 against `jlsq` 0.361. At 7.5 minutes a layer the full pass would take 5 hours, and a per-layer gain
+  of this size gave 3.5% of KL in section 16, so it was not run: **not adopted**, recorded as a small test. The step
+  count was always the last one, so a longer fit would gain a little more, not a different order of size.
+
+## 18. Training one part end to end on the Mac (design written 2026-11-17 00:55, before any run; `heal/mlx_part_train.py`)
+
+Layer-local fits (sections 16, 17) gain a few percent. End-to-end training on the original's answers is what moved
+the model so far, so the next small test asks which part is worth training, at the same budget, on the released
+model (wikil-a's LoRA on the 4-bit MLX cut).
+
+- **Parts**: `router` (all 40 routers, the unquantised gate rows, 9.3M parameters), `lora` (wikil-a's existing
+  LoRA, continued), `both`.
+- **Data**: the original's own answers from healing step 1 (`cache/heal_traces/teacher1`, 796 rows), loss on the
+  answer only; one sequence per step, at most 2,048 tokens; 300 steps (about 0.4M tokens), Adam, rate 1e-5 (router
+  rows 1e-4, as they are small and few).
+- **Measure**: KL to the original on the 60 held-out windows, every 100 steps; the best step is kept.
+- **Rule**: a part is worth a real run if it lowers KL by at least 0.005 (about 3%) below the released model's own
+  KL in this measure, and more than the `lora` control at the same tokens. The real run is then that part trained
+  on the full step 1 to 3 data (`data/astrantia_train.jsonl.gz`), judged as README 13's guard and facts rules.
+- **Result (11-17 00:50-01:05): not runnable on the Mac.** The routers are stored 8-bit (dequantised for training),
+  and the fast Gated DeltaNet kernel has no backward, so training mode takes mlx-lm's step-by-step path, which keeps
+  every token's state: one 2,048-token step went past 30 GB even with per-layer checkpointing, and at 512 tokens a
+  step took about 60 s (300 steps would be 5 hours). In the 10 steps that ran (router, rate 1e-4, cut answers) KL
+  rose from 0.2418 to 0.2594 on 10 windows. Moved to the GPU (Colab or GCP), where the training code already runs.
+
+## 19. More experts per token at inference (design written 2026-11-17 01:10, before any run; `heal/mlx_topk_kl.py`)
+
+- The cut keeps narrower experts (median 225 of 512 neurons), so each routed expert carries less. Letting the router
+  pick more of them per token (top-k above the original's 8) may bring the output closer, at the price of more
+  active parameters (about +0.08B per extra expert per token, router-mass weighted). No training.
+- **Measure**: KL to the original on the 60 held-out windows, the released model (4-bit MLX + wikil-a), top-k 8
+  (as released), 10, 12, 16.
+- **Rule**: a k is worth a closer look if KL falls by at least 0.005 against top-8. The closer look is the check set
+  with the 8,192 cap (README 8's guard) and the facts probes at that k; it is reported with its active parameters.
+- **Result (11-17 01:08, `cache/topk19*.json`)**: KL A+B by top-k: 6 → 0.1717, 7 → 0.1663, **8 → 0.1643**, 9 →
+  0.1642, 10 → 0.1646, 12 → 0.1679, 16 → 0.1769. The original's 8 is already the best; more experts per token add
+  noise from experts the cut left narrow. **Not adopted.**
+
+## 20. Router KD on the last layers, on the Mac (design written 2026-11-17 01:15, before any run)
+
+The paper's Router KD trains only the routers against the original's next-token distribution. On the Mac a full
+backward pass does not fit (section 18), but MLX computes gradients only for what is trainable, so training the
+routers of the last N layers needs a backward pass through those N layers only.
+
+- **Targets**: the original's top-64 log-probabilities on the 120 calibration windows C (`moe/teacher_windows.py`,
+  one streamed pass of the original on the Mac), the same kind as the stored targets for A and B.
+- **Training** (`heal/mlx_part_train.py --kd`): the released model (4-bit + wikil-a), routers of the last N = 8
+  layers (dequantised), loss = KL to those targets on every position of a C window, one window per step.
+- **Measure and rule**: KL on A and B (held out) every 50 steps; worth a real run (more layers and data, on the GPU)
+  if the best KL is at least 0.005 below the released model's 0.1643.
+- **Result (11-17 02:20-02:54, `cache/part20/`)**: rate 1e-4 made it worse at once (KL 0.164 → 0.203 at step 40,
+  stopped). **Rate 1e-5: KL 0.1640 → 0.1598 (40 steps) → 0.1581 (120) → 0.1571 (240)**, still falling, 123k tokens,
+  1.96M parameters (8 routers), 8.4 s a step on the Mac (peak 19 GB). The drop, 0.0069 (4.2%), passes the rule:
+  **worth a real run**. Section 16's best merge, with no training, gained 3.5% on a different measure (float32).
+- Before the real run: a control with the LoRA of the same 8 layers trained the same way (is it the router?), and
+  the routers of the last 16 layers for longer.
+- **Control (11-17 03:00-03:25)**: wikil-a's LoRA of the same 8 layers, trained the same way (KD on C, rate 1e-5,
+  240 steps): **KL 0.1643 → 0.1454 (−11.5%)**, against −4.2% for the routers. So it is not the router: **KD on the
+  original's distribution is the lever**, and the LoRA carries it better. Every heal so far was sequence-level (cross
+  entropy on the original's sampled answers); this is the first token-level KD, and 123k tokens on 8 layers did more
+  than any merge. The real run is therefore KD with the full LoRA (all layers) plus the routers, on the GPU (section 21).
+
+
+## 21. Token-level KD from the original, on the G4 (design written 2026-11-18 05:30, before any run)
+
+Section 20's control showed the lever: training wikil-a's LoRA against the original's next-token distribution (top-k
+log-probabilities), not its sampled answers, lowered chat KL by 11.5% with 123k tokens on 8 layers. The real run
+does this for all layers on a GPU (GCP, one RTX PRO 6000 96 GB; the original and the cut fit side by side).
+
+- **Windows** (`heal/kd_windows.py`): 1,024-token windows packed from three sources, a third each:
+  - chat: the original's own UltraChat answers (`jiapingW/qwen3.5-35b-a3b-ultrachat-regen`, prompt + answer in the
+    chat template, thinking included);
+  - reasoning: the original's math, science and code answers (`data/astrantia_train.jsonl.gz`, stages 1 and 3);
+  - general: Wikipedia text (`heal/wiki_text.py`), so the dropped knowledge has something to be taught on.
+  Any window sharing a 32-token run with a held-out window (chat A, B; general H) is dropped. About 2,000 windows
+  (2M tokens).
+- **Targets** (`heal/kd_targets.py`): the original (bf16, vLLM) gives its top-20 log-probabilities at every position
+  of every window (`prompt_logprobs`).
+- **Training** (`heal/kd_train.py`): the cut `g128b28160` with wikil-a's LoRA as the start, all LoRA layers trained
+  (rank 16, as before), loss = KL to the top-20 plus one bucket for the rest, bf16, one pass over the windows.
+- **Measure**: KL to the original on the chat windows A, B (top-64, `teacher.npz`) and the general windows H (top-64,
+  `cache/general_run/teacher_H.npz`), at the start and every 100 steps; the LoRA with the lowest chat KL is kept.
+- **Rule**: kept for the Mac evaluation if chat KL falls by at least 0.01 and general KL does not rise. Then, on the
+  Mac against the release: README 8's guard (check set, 8,192 cap), facts (wrong share of answered not up by more
+  than 0.03), MMLU-Pro thinking off (not lower by the paired sign test at p < 0.05). If all hold, it is the next
+  preview candidate.
+- **GPU**: one VM, deleted automatically after 6 hours (`--max-run-duration`), created only for the run.
+- **11-18 05:50, blocked**: creating the VM failed on the organisation policy `compute.vmExternalIpAccess` (deny
+  all), set by the Cloud Setup. No VM was made. Changing the policy, or adding Cloud NAT and an IAP firewall rule
+  instead, is the author's decision. Until then the Mac version below runs.
+- **Mac version (design written 11-18 05:55, before it ran)**: the same KD with the MLX trainer
+  (`heal/mlx_part_train.py --kd`), LoRA of the **last 16 layers** (what a backward pass fits on the Mac), on the
+  120 chat windows C and the 217 general windows G (the original's top-64 on G from `moe/teacher_windows.py`),
+  rate 1e-5, three passes. Held out: chat A, B and general H. Same rule as above (chat KL down by at least 0.01,
+  general KL not up); if it holds, the Mac evaluation follows.
+
+- **11-18 07:06**: the author allowed external IPs for My First Project only; SSH is limited to this Mac's address
+  and Google's IAP range, the RDP rule is off. On-demand G4 was out of stock in all three us-central1 zones (the only
+  region with G4 quota); a **Spot** G4 came up in us-central1-f. A Spot VM can be taken back at any time and is then
+  deleted; the pipeline is rerun if that happens.
+
+### Results of section 21 (2026-11-18)
+
+- **GPU run** (Spot G4, `cache/kd21_gpu/`): 2,100 windows (700 chat, 700 reasoning, 700 Wikipedia); the original's
+  top-20 on all of them took 4.5 minutes with vLLM; 263 steps of 8 windows took 32 minutes (6.7 s a step, 19 GB peak).
+  Held-out KL, bf16:
+
+  | step | chat (A, B) | general (H) |
+  |---:|---:|---:|
+  | 0 (wikil-a) | 0.1426 | 1.601 |
+  | 50 | 0.1250 | 1.570 |
+  | 150 | 0.1234 | 1.560 |
+  | 263 | **0.1228** (−13.9%) | **1.557** (−2.7%) |
+
+  **The rule holds** (chat down 0.020, general not up), so the Mac evaluation runs (`cache/queue_kd21.sh`). Most of
+  the gain comes in the first 50 steps; the general KL hardly moves: the LoRA (attention and shared expert) has no
+  room for what the dropped expert neurons held. Sections 22 and 23 test two ways of giving it room.
+- **Mac run** (last 16 layers, chat C + general G, 1,011 steps, 2.6 h, `cache/part21/lora_l16/`): chat KL
+  0.1643 → 0.1444 (best, step 672), general 1.652 → 1.538 (−6.9%). Its general windows G come from the same
+  generated text as H, so its larger general gain is partly in-distribution; Wikipedia windows (GPU run) are a
+  harder test. The rule holds here too, but the GPU run trains every layer and is the one evaluated.
+- Bugs met on the VM, fixed in `heal/gcp_kd21.sh`: no `python3-venv`, no `scipy`, no `g++` (vLLM compiles), and
+  vLLM's default 1,024 sequences exceed this model's Mamba cache (738): `max_num_seqs` = batch (64).
+
+## 22. Swap a few neurons, then KD (design written 2026-11-18 07:45, before any run)
+
+The idea (from GPT-6.2 Astra, passed on by the author): bring back a small number of the dropped neurons in place of
+kept ones, size fixed, and then distil from the original. Section 6l's numbers are why: the quarter mix moved the
+general KL from 2.365 to 1.284 but the chat KL from 0.150 to 0.170, and it lost code on `check_set2`; the merges of 16
+closed only 3.5% of the gap. A small swap may keep most of the general gain per seat while KD repairs the chat cost.
+
+- **Variants**: the plain mix of 6l with the general statistics at a weight of 1/32, 1/16 and 1/8 (`mix03`, `mix06`,
+  `mix12`; `moe/mix_stats.py` from `cache/heal_inputs/stats.npz` and `cache/general/calib_stats_general.npz`), cut
+  to `g128b28160` with `build_shape.py --from-stats`. Same size and shape as the current cut.
+- **Step 1, no training** (on the G4, bf16, wikil-a's LoRA): KL on chat A, B and general H for each
+  (`kd_train.py --eval-only`), next to the current cut measured by the same code (section 21's step 0).
+- **Choice for step 2**: the largest weight whose chat KL is at most 0.02 above the current cut's (the quarter mix's
+  cost in 6l); if none, step 2 is not run and the answer is "a swap costs too much on chat even when small".
+- **Step 2**: KD exactly as section 21 (same windows, targets, start, rate, steps). If the Spot VM's time runs out,
+  both runs are compared at the last step both reached.
+- **Rule**: the swap is better if after KD its chat KL is at most 0.005 above section 21's run and its general KL
+  at least 10% below it. Then it, not section 21's model, goes to the Mac evaluation of section 21, and the facts
+  probe (60 + 40) is added there.
+
+### Results of section 22 (2026-11-18; Spot G4, bf16, wikil-a's LoRA; `cache/swap22/`)
+
+| student | chat KL, untrained | general KL, untrained | chat KL after KD | general KL after KD |
+|---|---:|---:|---:|---:|
+| current cut (section 21) | 0.1426 | 1.601 | 0.1228 | 1.557 |
+| `mix03` (1/32) | 0.1430 | 1.542 | – | – |
+| `mix06` (1/16) | 0.1446 | 1.448 | – | – |
+| `mix12` (1/8) | 0.1483 | 1.253 | **0.1257** | **1.179** |
+
+- All three are within the 0.02 chat limit, so the largest, `mix12`, was trained (263 steps, 32 minutes).
+- **The rule holds: after KD the chat KL is 0.0029 above section 21's run (limit 0.005) and the general KL 24% below
+  it (asked: 10%).** KD halved the swap's chat cost (0.0057 → 0.0029) and kept almost all of its general gain.
+- Per the rule, `mix12` + KD replaces section 21's model in the Mac evaluation (`cache/queue_mix12.sh`: a 4-bit MLX
+  build of `mix12` from the same statistics, then facts, guard, MMLU-Pro and IFEval). Section 21's model got as
+  far as the facts (sets 1 and 2: right 19, wrong 45, abstains 56, wrong of answered 0.70 against wikil-a's 0.68)
+  and the check set's first pass; its queue was stopped there.
+- Added 11:20, before it runs, exploratory (reported, not a rule): the quarter mix (`mix25`, 6l) under the same KD,
+  on the same VM after section 23, to see whether KD also repairs the larger swap (untrained chat cost 0.020 in 6l).
+  If it ends within 0.005 of `mix12`'s chat KL with a general KL at least 10% lower, the next round starts from it.
+- **Mac evaluation, facts (13:36; 4-bit MLX, thinking off, 1,024 tokens; `cache/halluc*/g128b_mix12kd/`).** Sets 1 and 2
+  (60 + 60 questions with one short answer; 40 made-up and 10 real items in set 1):
+
+  | model | right | wrong | abstains | wrong of answered | made-up items described |
+  |---|---:|---:|---:|---:|---:|
+  | wikil-a (released) | 19 | 40 | 61 | 0.68 | 25 / 40 |
+  | section 21 KD | 19 | 45 | 56 | 0.70 | 26 / 40 |
+  | **`mix12` + KD** | **52** | **40** | **28** | **0.43** | 27 / 40 |
+
+  Section 21's limit (wrong of answered not more than 0.03 above wikil-a) holds with a wide margin: the swap brings
+  facts back (right answers 19 → 52) with the same number of wrong ones. The made-up items are described as often
+  as before (the original refuses them), so this is knowledge, not more willingness to guess. The guard, MMLU-Pro
+  and IFEval follow in the same queue.
+- **Mac evaluation, guard (16:45; check set, 8,192 cap, code graded on Kaggle; `cache/gap/grades_guard_mix12kd/`)**:
+  science 13, math 17, code 14 (total 44) against wikil-a's 13, 18, 13 (total 44). README 8's limits (code not down
+  by 2+, total not down by 3+, science not down by 2+) hold; the code loss that sank the quarter mix in 6l does not
+  appear at 1/8. Science has 5 answers cut at the cap (wikil-a 4), 3 of them looping.
+- **Mac evaluation, MMLU-Pro (18:15; 280, thinking off, graded on Kaggle; `cache/gap/grades_mix12kd_mmlu/`)**: 121 against
+  wikil-a's 123; 25 right only for wikil-a, 23 only for `mix12` (exact sign test p = 0.89): not lower. With the
+  facts and the guard, section 21's Mac rule holds, so `mix12` + KD is the next preview candidate and section 24
+  starts (IFEval is still running and is reported when done).
+- **Mac evaluation, IFEval (19:48; 541, thinking off, graded on Kaggle; `cache/gap/grades_mix12kd/`)**: 364 against
+  wikil-a's 366 (instructions 646 against 635 of 834): within section 13's limit of 10. Every Mac check holds.
+- **Result (12:30; `cache/swap22/kd_mix25/`): no.** Untrained, `mix25` is at chat 0.1577 and general 1.016; after
+  the same KD 0.1331 and 0.927. The general KL is 21% below `mix12`'s, but the chat KL is 0.0074 above it (limit
+  0.005), so the next round starts from `mix12`. KD does repair the larger swap too (chat cost against section 21
+  0.015 untrained, 0.010 after), but not as far as the small one.
+
+## 23. Wider shared experts under the same KD (design written 2026-11-18 09:55, before any run)
+
+Section 21's first numbers (step 150: chat KL 0.143 → 0.123, general 1.601 → 1.560) say the LoRA (attention and the
+shared expert, rank 16) repairs chat text but barely moves general text: the knowledge sat in dropped expert neurons
+and the LoRA has no room for it. The author's third idea, a shared residual expert, gives it room in the model's own
+architecture: each layer's shared expert gets 512 more neurons (`shared_expert_intermediate_size` 512 → 1024;
+126M parameters, +1.3% of 9.4B), gate and up started like the model's own weights, down at zero, so the model starts
+unchanged (`kd_train.py --shared-extra 512`, rate 1e-4 for the new neurons, 5e-5 for the LoRA).
+
+- Same windows, targets, start LoRA, steps and student (the current cut) as section 21; run on the same VM after
+  section 22.
+- **Rule**: kept if, against section 21's run at its last step, the general KL is at least 5% lower and the chat KL
+  at most 0.003 higher. Kept means it is the base for the next KD run (more general windows, longer); the Mac
+  evaluation waits for that run.
+
+### Results of section 23 (2026-11-18 12:30; Spot G4, bf16; `cache/kd23/`)
+
+| run (current cut, 263 steps) | chat KL | general KL |
+|---|---:|---:|
+| section 21 (LoRA only) | 0.1228 | 1.557 |
+| + 512 shared neurons per layer | 0.1199 | 1.505 |
+
+- **The rule does not hold: the general KL is 3.3% lower (asked: 5%).** The chat KL is 0.003 lower, so the extra
+  neurons help both a little, but not by the margin set before the run; the next run does not add them. The swap of
+  section 22 moved the general KL seven times as far at no extra size.
+- The VM was deleted by hand at 12:35 once every result was on the Mac (it would have deleted itself at 13:06).
+
+## 24. Four times the KD data for the swapped cuts (design written 2026-11-18 14:00, before any run)
+
+Section 22's KD used 2,100 windows; on `mix12` the general KL was still falling at the end (1.253 → 1.179) and the
+facts came back on the Mac (right 19 → 52). Section 23 showed that more room in the shared expert is not the lever.
+This run asks whether more data is: the same KD with four times the windows, on the two swaps of section 22.
+
+- **Windows**: 8,400 new windows from `heal/kd_windows.py` (2,800 each of chat, reasoning and Wikipedia; Wikipedia
+  from 4,000 pieces), same exclusion of the held-out windows A, B and H. The original's top-20 on all of them.
+- **Run a**: `mix12`, wikil-a's LoRA as the start, one pass (1,050 steps of 8), rate and loss as section 21.
+- **Run b**: `mix25` the same way, after run a.
+- **Measure**: chat KL (A, B) and general KL (H) every 150 steps, as before.
+- **Rule for run a**: it replaces section 22's `mix12` + KD as the candidate if, at its best step, the chat KL is
+  not higher than 0.1257 and the general KL at least 5% lower than 1.179. Then it gets the same Mac evaluation
+  (facts, guard, MMLU-Pro, IFEval).
+- **Rule for run b**: it replaces run a if its chat KL is at most 0.005 above run a's and its general KL at least
+  10% below (the rule `mix25` failed in section 22 by 0.0024).
+- **Added 16:00, before any run (a suggestion from GPT-6.2 Astra, passed on by the author)**: the LoRA is saved at every
+  evaluation (`--keep-every-eval`), not only the lowest chat KL and the last. The checkpoint taken is, among those
+  that meet the rule, the one with the lowest general KL; run b is compared at its checkpoint chosen the same way.
+- **Also measured on the Mac, per question against wikil-a**: how many right answers are new, how many old wrong
+  answers are fixed, and how many new wrong answers appear where wikil-a abstained. For `mix12` + KD (section 22):
+
+  | wikil-a's verdict | `mix12` right | `mix12` wrong | `mix12` abstains |
+  |---|---:|---:|---:|
+  | right (19) | 16 | 3 | 0 |
+  | wrong (40) | 20 | 18 | 2 |
+  | abstained (61) | 16 | 19 | 26 |
+
+  Of the 35 questions it newly answered, 16 are right and 19 wrong: the knowledge is back, but answering when unsure
+  is not fixed. Not a rule for this run; it is the next question (below).
+- **19:10, while running**: the reasoning traces ran out at 1,881 windows (2,800 chat, 2,800 Wikipedia), so the run
+  has 7,481 windows (3.6 times section 22's), 935 steps a run. Nothing else changed.
+- **Results (22:36; Spot G4, the two runs side by side from 19:50, 10 s a step each; `cache/kd24_mix12/`, `cache/kd24_mix25/`)**:
+
+  | step | `mix12` chat | `mix12` general | `mix25` chat | `mix25` general |
+  |---:|---:|---:|---:|---:|
+  | 0 | 0.1483 | 1.253 | 0.1577 | 1.016 |
+  | 150 | 0.1261 | 1.177 | 0.1340 | 0.925 |
+  | 450 | 0.1248 | 1.159 | 0.1312 | 0.906 |
+  | 750 | 0.1237 | 1.153 | 0.1306 | 0.901 |
+  | 936 | 0.1238 | 1.152 | 0.1306 | 0.900 |
+
+  - **Run a fails the rule**: the chat KL holds (0.1238 against 0.1257), but the general KL is 2.3% below 1.179 at
+    its best (asked: 5%). 3.6 times the data adds little: KD on this LoRA is near its ceiling. Section 22's `mix12` +
+    KD stays the candidate.
+  - **Run b fails too**: its chat KL is 0.0068 above run a's (limit 0.005).
+  - The VM was deleted at 22:45 once both were on the Mac.
+- **Next, not in this run**: a small KD on pairs of a real rare item and a made-up one in the same place (a real
+  API and a plausible fake in the same library), kept only where the original describes the real one and corrects
+  the fake; against plain KD for the same tokens from the same start; held-out pairs from other libraries and
+  names, counting made-up items described and real items described correctly together (so a model that just says
+  "I don't know" to everything does not pass).
+- **GPU**: one Spot G4 (`heal/gcp_kd24.sh`), about 5 hours, deleted automatically after 7. Started only once
+  section 22's `mix12` + KD has its guard and MMLU-Pro results on the Mac (if it fails the guard, this run is
+  reconsidered first).
+
+## 25. Next G4 batch: pairs of real and made-up items, and the Preview 2 build (draft 2026-11-18 23:00, before any run)
+
+Section 24 says more of the same data no longer helps; the weak point left in `mix12` + KD is answering when unsure
+(section 24's table: of 35 newly answered facts, 19 wrong; 27 of 40 made-up items described). One G4 rental does
+both of the following. A plan from GPT-6.2 Astra is expected; this draft is final only after it is read.
+
+- **A. Pair KD (experiment)**
+  - Pairs: a real item and a made-up one of the same kind. Real Python APIs come from introspecting the standard
+    library (so they surely exist); real names in science, history and culture from Wikipedia article titles;
+    made-up ones are built from the same parts and checked to be absent (no such attribute; no such title).
+    None of the 50 items of the facts probe's set 1 or anything close to them is used.
+  - The original (vLLM, thinking off, the probe's own prompt form) answers both sides; a pair is kept only if it
+    describes the real item and denies the made-up one (the probe's own verdict).
+  - Training: KD to the original's top-20 on the kept answers, mixed half and half with section 22's kind of
+    windows, from section 22's `mix12` + KD LoRA. Control: the same start and the same number of tokens of plain KD.
+  - Held out: pairs from other libraries and other title ranges, plus the probe's 40 made-up and 10 real items
+    and the 120 facts. Rule (to be fixed before the run): made-up items described down, real items described not
+    down, facts right not down; then the guard and MMLU-Pro as section 21.
+- **B. Preview 2 build** (the author chose the G4 over waiting for Kaggle): build `mix12` (bf16, uneven), fold the
+  chosen LoRA (section 22's, or A's if it passes every check), check the folded KL against the run's own (within
+  0.01), make the padded checkpoint and the GGUF Q4_K_M, and upload to the same repository as a pull request.
+  The author logs in to Hugging Face on the VM; the merge on Hugging Face is theirs.
+
+## 26. Where Japanese breaks, and expert LoRA (design written 2026-11-18 23:20, before any run; plan from GPT-6.2 Astra, decided here)
+
+**A. Four-way language check (Mac, now)**: 20 questions (5 arithmetic, 5 everyday advice, 5 science explanations,
+5 short code explanations), each asked in Japanese and in English and answered in Japanese and in English
+(`fix_task/jp4_set.jsonl`, 80 prompts, thinking off, 1,024 tokens), for `mix12` + KD and for wikil-a. Each answer is
+read for three things apart: right content, natural language in the language asked, finished without looping
+(arithmetic and three code items also checked by pattern). The old direct check had only two Japanese items.
+- Reading, set before the answers: if ja→en is close to en→en and only the Japanese answers break, the first repair
+  is small: the original writes short, natural Japanese answers to questions `mix12` already gets right in English,
+  and KD is on those answers. If ja→en also falls, the input side needs repair too (parallel ja/en questions with
+  the same answer); if that is weak, Japanese text joins the neuron statistics of the next cut.
+
+**B. Expert LoRA (next G4 batch)**: so far KD trains attention, Gated DeltaNet and the shared expert; the routed
+experts stay fixed. On an earlier shape a rank-8 LoRA on the experts reached KL 0.203 in 2.5M tokens where the plain
+LoRA needed 6M for 0.208 (run log of 2026-11-09; the 2.5M included 1.5M of loop-exit data). Two arms from section 22's `mix12` + KD, same targets, tokens and order: A the
+plain LoRA continued; B the same plus a low-rank update on each kept expert's `down_proj` only (router and widths
+fixed; folded into the weights afterwards, so still 9.4B).
+- Before any rental: on the Mac (CPU, a small synthetic uneven layer), the trained output and the folded output
+  must match; folding into routed experts is not supported yet (`heal/fold_lora_uneven.py`), which is why this was
+  skipped before (section 8: `ExpertLoRA` and the Mac adapter do not handle experts of different widths).
+- Rule (fixed before the run): B is kept if its general KL is at least 5% below A's and its chat KL not higher; then
+  the Mac checks (facts, guard, MMLU-Pro) decide, with the paired counts reported.
+- **Built and tested (2026-11-19, Mac CPU)**: `moe/uneven.py` `add_down_lora` (A stored like `down`, (r, sum w);
+  B (E, H, r), zero at the start; the grouped training path runs the A part through the same ragged kernel as
+  `down` and B through a new one with its own backward), `kd_train.py --expert-r`, and `fold_lora_uneven.py`
+  folding it into each layer's `down`. `moe/test_down_lora.py` on a synthetic layer (7 experts of widths 1–12):
+  grouped and loop paths agree in output and in the gradients of x, A and B (within 4e-15, float64); a fresh
+  LoRA leaves the output unchanged; folded without LoRA against trained with LoRA: 1.3e-7 of the output's size in
+  float32, 0.9% in bf16 (rounding of the folded weights). PASS. Not done yet: the Mac (MLX 4-bit) path for B, which
+  is needed only if B passes the KL rule (then the update is folded into the dequantized experts and requantized;
+  written as `heal/fold_expert_lora_mlx.py`, not yet run; `to_mlx_adapter.py` now skips the expert keys).
+- **Result (2026-11-19, G4, README 28's batch; `cache/b27/ctrl`, `cache/b27/B`)**: 3,000 windows of 1,024 tokens
+  (plain, one pass), both from section 22's LoRA (step 0: chat 0.1257, general 1.1786, Japanese 2.2768).
+
+  | step | ctrl chat / general / Japanese | B chat / general / Japanese |
+  |---:|---|---|
+  | 75 | 0.1250 / 1.1717 / 2.2576 | 0.1231 / 1.1751 / 2.2381 |
+  | 150 | 0.1249 / 1.1677 / 2.2347 | 0.1229 / 1.1553 / 2.1959 |
+  | 225 | 0.1243 / 1.1632 / 2.2224 | 0.1221 / 1.1490 / 2.1719 |
+  | 300 | 0.1242 / 1.1629 / 2.2180 | 0.1219 / 1.1464 / 2.1610 |
+  | 375 | 0.1240 / 1.1614 / 2.2155 | 0.1217 / 1.1428 / 2.1572 |
+
+  By the rule: at the last step B's general KL is 1.6% below ctrl's (1.1428 against 1.1614; 5% was needed), its
+  chat KL lower (0.1217 against 0.1240). **B is not kept**; the MLX fold is not run. B is ahead at every step
+  after 75 and the gap was still widening (general 0.004, 0.012, 0.014, 0.017, 0.019), so more tokens might reach
+  5%, but that was not the rule. ctrl itself moved little from section 22's LoRA (general -1.5%, chat -0.0016):
+  plain KD from this start is near its floor at this length.
+
+**Order** (the author's suggestion): A runs now and its result goes to Astra; B is built and tested meanwhile; the
+next G4 batch then carries B, section 25's pair KD, any Japanese repair A calls for, and the Preview 2 build.
+
+### A. Result (2026-11-19; Mac 4-bit, thinking off, 1,024 tokens; `cache/jp4/`)
+
+Content was graded by hand (1 right, 0.5 partly, 0 wrong or no answer; `cache/jp4/manual_grades.py`) apart from the
+language (share of Japanese script in the answer, `auto.json`) and looping (a repeated phrase; most loops also hit
+the 1,024 limit). Per direction, 20 answers each:
+
+| model | direction | content | in the language asked | looping | cut at 1,024 |
+|---|---|---:|---:|---:|---:|
+| `mix12` + KD | ja→ja | 7.5 | 19 | 8 | 8 |
+| | ja→en | 12.5 | 11 | 4 | 3 |
+| | en→ja | 12.5 | 20 | 9 | 10 |
+| | en→en | 17.0 | 20 | 0 | 0 |
+| wikil-a | ja→ja | 10.5 | 20 | 7 | 9 |
+| | ja→en | 15.5 | 10 | 4 | 3 |
+| | en→ja | 10.5 | 20 | 11 | 9 |
+| | en→en | 18.0 | 20 | 2 | 2 |
+
+- **ja→en, content and the English request apart (Astra's ask)**: about half the Japanese questions were answered in
+  Japanese although English was asked (`mix12` 9 of 20, wikil-a 10; mostly the science and code items). Where the
+  answer was in English, content matched en→en on the same questions for wikil-a (10 of 10 against 10) and fell a
+  little for `mix12` (7 against 9: "25%引き" read as the price after a rise, "雨の日の過ごし方" read as keeping out of
+  the rain, one physics slip). Where it was in Japanese, content fell (5.5 against 8 for both) and 3–4 looped.
+- **The Japanese answers break, whatever the question language**: 7–11 of 20 loop in every direction that answers in
+  Japanese, against 0–2 for en→en; about 7 in 10 Japanese answers mix in Chinese words (的, 是, 因为, 输出, ...), and
+  none reads as natural Japanese. Arithmetic shows it best: the same question asked in Japanese is right when
+  answered in English (60 km/h × 2.5 h = 150, 4x + 7 = 35 → 7) and wrong when answered in Japanese (140; "x = 7"
+  then "corrected" to 6; "25%引き" added to 2,500) — in both models.
+- Code explanations survive in Japanese (content 5 of 5) but are written half in Chinese.
+- `mix12` + KD is no better at Japanese than wikil-a (ja→ja 7.5 against 10.5, ja→en 12.5 against 15.5; en→ja
+  12.5 against 10.5); 20 questions are too few to call these gaps, but section 22's KD did not repair Japanese.
+- **Reading, by the rule fixed above**: ja→en (answered in English) is close to en→en and the Japanese answers break,
+  so the first repair is on the output side: KD on short, natural Japanese answers from the original. The data also
+  carries Japanese questions with the original's English answers, because half the "answer in English" requests were
+  ignored. A separate input-side repair (parallel ja/en questions) is not needed now; it is decided after the output
+  repair, on this same set.
+
+## 27. Japanese answers: KD on the original's short Japanese answers (design written 2026-11-19, before any run; plan from GPT-6.2 Astra, decided here)
+
+Section 26 A: the cut model reads Japanese well enough, and breaks while writing it (loops, Chinese words, right
+answers turned wrong mid-explanation). What was tried before and why this differs:
+- Section 11 part L (inside wikil-a): plain next-token training on 406k tokens of the original's Japanese answers
+  (among 23 languages, long answers, thinking on and off). Japanese still breaks after it (section 26 A).
+- Sections 22 and 24: token-level KD, but the Japanese in them is Wikipedia text (a quarter of the general pieces),
+  not answers. That fits what section 26 A found: reading held, writing did not.
+- Here: token-level KD (the original's top-20 at every position, not only its sampled token) on **answers** in
+  Japanese, short ones (a conclusion and a brief reason), on easy questions of the kinds the cut model answers right
+  in English (section 26 A's en→en: arithmetic, code 10 of 10; science 10 of 10).
+
+**Data** (`heal/ja_data.py`, run on the VM; the original through vLLM, thinking off, up to 700 tokens, finished
+answers only)
+- Questions: Japanese prompts written by people (the Aya dataset's Japanese rows, 20–600 characters), plus English
+  questions of section 21's kinds (UltraChat first turns; the math, science and code prompts of
+  `data/astrantia_train.jsonl.gz`) translated into Japanese by the original. Nothing from section 26's
+  `jp4_set` or section 27's held-out set (below); a prompt sharing an 8-word run (or 20 characters in a row) with them is dropped.
+- Three forms: ja→ja 60%, en→ja 20% (an English question with a request for Japanese), ja→en 20% (a Japanese
+  question with a request for English). Requests are worded in several ways, none the same as `jp4_set`'s.
+- The original is asked to answer briefly with its conclusion first ("結論から簡潔に" in the prompt; the KD
+  target is the original's distribution under exactly that prompt).
+- Kept only if: finished, in the language asked (Japanese script at least half of the letters for Japanese; under 5%
+  for English), no Chinese marker words, no 6-gram repeated 4 times.
+- Mix and amount: the kept answers make 40% of the KD windows; the rest are section 21's three sources as before
+  (chat, reasoning, Wikipedia), so chat and general are kept. About 3M tokens, from section 22's `mix12` + KD LoRA.
+  Astra's other filter (only questions `mix12` itself gets right in English) is not used: the uneven student has no
+  fast generation on the VM. The easy-question choice stands in for it, and this is stated as a difference.
+
+**Measures** (fixed before the run)
+- On the G4: chat KL A+B and general H as always, plus a Japanese KL on 120 held-out windows of the original's
+  Japanese answers (questions not used in training).
+- On the Mac: a new set, `fix_task/jp5_set.jsonl` (20 new questions of section 26's four kinds, written for this
+  check, × the same four directions; not used for anything before this run). Each answer read as in section 26 A:
+  content (with the right conclusion kept to the end), natural language in the language asked, finished without
+  looping. Then the guard (check set, 8,192 cap), the facts and MMLU-Pro as section 22.
+- **Rule**: the run is kept as the Preview 2 candidate if all hold:
+  1. chat KL not more than 0.003 above section 22's 0.1257, general KL not more than 3% above 1.179;
+  2. Japanese KL down by at least 15% from section 22's LoRA on the same windows;
+  3. on `jp5_set`, the two directions that answer in Japanese (40 answers): loops at most half of section 22's
+     LoRA's count on the same set, and content up by at least 4 of 40;
+  4. en→en content not down by more than 1 of 20, with arithmetic and code each not down; ja→en answered in English
+     up by at least 4 of 20;
+  5. guard, facts and MMLU-Pro not worse than section 22's beyond the noise allowed there (paired counts reported).
+  If 1–2 fail, the Mac checks are skipped. If 3 fails while 1, 2 and 4 hold, the next step is section 26's last
+  branch: Japanese text joins the neuron statistics of the next cut.
+- Cheap side check in the same rental (optional; dropped if it would delay the batch): which share of the neurons that Japanese answers use most (the original's
+  activation statistics on 200 of the kept answers) was cut in `mix12`, against the same share for English answers.
+  It is only read; it decides nothing in this run.
+
+### Result, jp5 (2026-11-19; Mac 4-bit, thinking off, 1,024 tokens; `cache/jp5/`)
+
+J is README 28's run (40% of the KD windows the original's Japanese answers, 317 steps, step 317 by the
+selection rule). Its KL part: Japanese KL 2.277 → 1.854 (-18.6%), chat 0.1259, general 1.1715, so rules 1 and 2
+hold. jp5 (80 answers per model), content graded by hand (`cache/jp5/manual_grades.py`; the two models read side by
+side, not blind), language and looping by `heal/jp_auto.py` (the same measure as section 26 A's `auto.json`, which
+it reproduces exactly):
+
+| direction | section 22's LoRA: content / loops | J: content / loops |
+|---|---|---|
+| ja→ja | 10.0 / 7 | 9.0 / 5 |
+| en→ja | 9.0 / 10 | 11.0 / 6 |
+| ja→en | 12.5 / 2 (in English 10) | 14.0 / 1 (in English 15) |
+| en→en | 14.5 / 0 | 14.0 / 0 |
+
+- Rule 3 (the 40 answers in Japanese): loops 17 → 11 (at most 8 needed), content 19 → 20 (+4 needed). **Fails.**
+- Rule 4: en→en 14.5 → 14 (down 0.5, at most 1 allowed), arithmetic 5 → 5, code 2 → 2; ja→en answered in English
+  10 → 15 (+4 needed). Holds.
+- **J is not the Preview 2 candidate.** By the rule, the next step is section 26's last branch: Japanese text joins
+  the neuron statistics of the next cut. (Rule 5 is still measured for the record: facts below.)
+- What changed and what did not: fewer loops and more English when English is asked, but the Japanese written is
+  as broken as before: Chinese words in most answers (所以, 因此, 的, 是), invented words (ラバチ, アモレア,
+  ミクロッチ), and in the advice questions repetition that starts within the first lines. Arithmetic in Japanese
+  stays right but fragile (J's ja→ja "x = 10", then 35, then a "correction"). 3M tokens of KD lowered the Japanese
+  KL by a fifth and moved the answers little: what is missing looks like capacity cut away, not something KD on
+  answers can restore at this size, which agrees with section 11 part L.
+- Both models miss the same items in every language: `"hello"[::-1]` (wrong in all 8 answers), 404 (all 8),
+  git add/commit (7 of 8). Those are the cut's knowledge losses, not a language problem.
+
+## 28. The next G4 batch, as sent (2026-11-19, before any run; `heal/gcp_b27.sh`)
+
+One Spot G4 rental carries sections 25 A, 26 B and 27. All four runs start from section 22's `mix12` + KD LoRA,
+take 3,000 windows of 1,024 tokens (one pass), are measured every 75 steps (chat A+B, general H, and section 27's
+Japanese KL on 120 held-out windows), and keep a LoRA at every measurement:
+- ctrl: plain windows (section 21's three sources) — the shared control;
+- B: the same windows plus the down_proj LoRA of rank 8 (section 26 B's arm B; ctrl is its arm A);
+- J: 40% section 27's Japanese answers (`heal/ja_data.py`), 60% plain;
+- P: 50% section 25's kept real/made-up pairs (`heal/pair_data.py`), 50% plain.
+Section 25 A's control ("the same number of tokens of plain KD") is ctrl. Its rule, fixed now: P is kept if on the
+held-out pairs (Python modules and title names never trained on; `pair25/held.jsonl`) and on the facts probe's
+40 made-up and 10 real items the made-up items described go down by at least 5 (of the 40, and separately of the
+held-out made-up items) against section 22's LoRA, real items described go down by at most 1 of 10 (and at most 5% of
+the held-out real items), facts right not down beyond 2; then the guard and MMLU-Pro as section 22.
+- Changed from section 25 B: the Preview 2 build is **not** in this rental. J and P may change which LoRA goes out,
+  and that is known only after the Mac checks; building section 22's LoRA now would mean building twice. The build
+  follows the Mac checks (on the next G4 rental or on Kaggle after its weekly reset).
+- A 2-step smoke run of B with the Japanese KL comes first; if it fails, B is skipped and the rest goes on.
+- Which saved LoRA goes to the Mac (fixed before the results): for J, the one with the lowest Japanese KL among those
+  meeting section 27's rule 1 (chat KL at most 0.1287, general KL at most 1.214); for P, the last one meeting the same
+  limits. B against ctrl: both at their last measurement. If no saved LoRA of a run meets the limits, the run is
+  reported and not taken to the Mac.
+- Added 11-19 while the KD runs were going, before any result: the pairs kept were 179 of 1,351 asked (Python 81
+  of 491, titles 98 of 860; the original had to describe the real one and deny the made-up one, both), so P trains
+  on 644 pair windows. The held-out set came out at 748 items; on the Mac the held-out check uses a fixed 200
+  (`pair25/held200.jsonl`: 50 of each of python-real, python-fake, titles-real, titles-fake, the first by the md5
+  of the id), so "at most 5% of the held-out real items" is at most 5 of 100.
+
+### Result, KL part (2026-11-19, G4 `b27`, about 3h20m of runs; `cache/b27/`)
+
+Step 0 (section 22's LoRA): chat 0.1257, general 1.1786, Japanese 2.2768. Last measurement of each run:
+
+| run | windows | steps | chat KL | general KL | Japanese KL | Japanese KL vs step 0 |
+|---|---|---:|---:|---:|---:|---:|
+| ctrl | plain | 375 | 0.1240 | 1.1614 | 2.2155 | -2.7% |
+| B | plain + expert LoRA | 375 | 0.1217 | 1.1428 | 2.1572 | -5.3% |
+| J | 40% Japanese answers | 317 | 0.1259 | 1.1715 | 1.8540 | **-18.6%** |
+| P | 50% real/made-up pairs | 268 | 0.1245 | 1.1694 | 2.2421 | -1.5% |
+
+(J: 2,536 windows, P: 2,144, as the Japanese and pair data gave; J's Japanese KL by measurement: 1.9781, 1.9045,
+1.8660, 1.8560, 1.8540.)
+- Section 27 rule 1 (chat ≤ 0.1287, general ≤ 1.214): every saved LoRA of every run meets it. J's chat KL rose at
+  most to 0.1266 (step 150) and ended at 0.1259.
+- Section 27 rule 2 (Japanese KL down at least 15%): **J passes** (-18.6%). Most of it came in the first 75 steps
+  (-13%).
+- B: not kept (section 26 B).
+- To the Mac by the rule fixed above: J step 317 (its lowest Japanese KL), P step 268 (its last).
+- The VM was deleted once everything was fetched.
+
+### Result, P on the held-out pairs (2026-11-19; Mac 4-bit, thinking off; `cache/pairs/`, `heal/pair_grade.py`)
+
+| answers | Python real described | Python made-up described | title real described | title made-up described |
+|---|---:|---:|---:|---:|
+| section 22's LoRA | 38 / 50 | 23 / 50 | 48 / 50 | 45 / 50 |
+| P (step 268) | 42 / 50 | 23 / 50 | 47 / 50 | 42 / 50 |
+
+- Made-up items described: 68 → 65 of 100 (down by 3; at least 5 needed). Real items described 86 → 89. By the
+  rule, **P is not kept** whatever the facts probe shows (it is still run for the record).
+- Spot check of the grader: P's answers to made-up names are confident inventions (`enum.BufferedStrEnum` "combines
+  Buffered and StrEnum behaviors"; a made-up "Ramvistic theorem" given as Thales's theorem). 644 windows of pairs
+  (179 pairs, about 30% of P's windows) taught the pattern on the trained names and did not carry over to new ones.
+  The original itself kept only 179 of 1,351 pairs, so it, too, often describes or denies wrongly here.
+
+### Result, facts probe for P and J (2026-11-19; both sets, 120 facts, 40 made-up and 10 real names; thinking off)
+
+| answers | facts right / wrong / abstains | wrong of answered | made-up names described / denied | real names described |
+|---|---|---:|---|---:|
+| section 22's LoRA | 52 / 40 / 28 | 0.43 | 27 / 13 | 9 |
+| P | 52 / 47 / 21 | 0.47 | 24 / 16 | 10 |
+| J | 49 / 58 / 13 | 0.54 | 29 / 11 | 8 |
+
+- P: made-up names described 27 → 24 (down 3; 5 needed) — the probe part of P's rule fails too, as on the held-out
+  pairs. Facts right unchanged, but 7 fewer abstentions turned into 7 more wrong answers.
+- J: abstentions 28 → 13 and wrong answers 40 → 58, right 52 → 49 — J answers more and guesses more. This is what
+  the Aya Japanese prompts (mostly short trivia questions answered with confidence) were feared to teach (noted
+  when the data was made); it would fail rule 5 as well.
+- **Outcome of this batch: no run is kept.** Preview 2 goes out with section 22's LoRA (the build planned in
+  section 25 B, on the next rental; it needs the author on the VM for the Hugging Face login). Next for Japanese:
+  section 26's last branch (Japanese text in the next cut's neuron statistics). For made-up names: pairs on the
+  trained names do not carry over to new names at this amount; not repeated as is.
+
+## 29. Did J's KD move reading or writing? Loss on the question and the answer apart (design written 2026-11-19, before any run; plan from GPT-6.2 Astra, decided here)
+
+- Why: J lowered the Japanese KL by 18.6% and the answers barely changed (section 27). Before the next cut, which
+  part moved: the reading of a Japanese question, or the writing of the answer?
+- Data: section 27's 150 held-out rows (`cache/b27/ja27/held.jsonl`; all ja→ja: a Japanese question, a request
+  such as "結論から簡潔に答えてください。", the original's answer; none used in training). Each row in the same
+  thinking-off chat format as the KD windows (`kd_windows.ja_ids`), cut at 2,048 tokens.
+- Measure: next-token cross-entropy of the Mac 4-bit cut (`mlx_g128b28160_q4`) with each LoRA, split by token into
+  (a) the question body, (b) the request phrase (one of four, all seen in J's training; reported apart, not read),
+  (c) the answer, also split into its first 100 tokens and the rest. Template tokens are left out.
+  The teacher's distributions for these rows were on the deleted VM and the original does not fit on the Mac, so
+  this is cross-entropy, not KL. On the answers (the original's own samples, temperature 0.7) the difference in
+  cross-entropy between two LoRAs estimates their difference in KL to the original (the original's entropy is the
+  same for both, up to the sampling temperature); on the questions (written by people, or translated by the
+  original) it measures how well each predicts Japanese text.
+- Models: section 22's LoRA (the start), ctrl (plain KD, the same steps as B: what more plain KD alone does), J
+  (step 317, the one checked in section 27).
+- Reported: per part, the mean loss per token for each model, and J's drop against section 22's LoRA and against
+  ctrl, with a 95% interval from a paired bootstrap over the 150 rows.
+- Reading (fixed now; it decides only the Japanese text in the next cut's neuron statistics, not whether to cut):
+  - if J's drop against ctrl on the question bodies is less than half of its drop on the answers, the KD moved
+    mostly the writing: the next cut's statistics take the original's Japanese answers as well as Japanese text
+    written by people (half each);
+  - otherwise reading and writing moved together: Japanese text written by people (Wikipedia, Aya) is enough.
+  - If neither drop is outside its interval, the measure says nothing and the default is the first branch.
+
+### Result (2026-11-19; Mac 4-bit, about a minute a model; `cache/ja_split/`, `cache/queue_split.sh`)
+
+Tokens: question bodies 8,773, request phrases 1,542, answers 19,602 (first 100 of each answer 11,856, the rest
+7,746). Loss per token (nats):
+
+| part | section 22's LoRA | ctrl | J | J's drop against ctrl (95% interval) |
+|---|---:|---:|---:|---|
+| question body | 5.431 | 5.325 | 4.928 | 0.397 [0.369, 0.423] (-7.5%) |
+| request phrase | 5.227 | 5.182 | 4.070 | 1.112 [1.035, 1.196] (-21.5%) |
+| answer | 3.394 | 3.337 | 2.991 | 0.346 [0.326, 0.365] (-10.4%) |
+| answer, first 100 tokens | 3.255 | 3.199 | 2.863 | 0.336 [0.312, 0.358] (-10.5%) |
+| answer, the rest | 3.607 | 3.549 | 3.187 | 0.362 [0.329, 0.395] (-10.2%) |
+
+ctrl against section 22's LoRA: question -0.106, answer -0.057 (about 2%).
+- Sanity: the answer loss of section 22's LoRA (3.39) is about the G4's Japanese KL (2.28) plus the original's own
+  entropy on its answers (about 1 nat), so the Mac 4-bit numbers agree with the G4's.
+- **By the rule: J's drop on the question bodies (0.40) is more than half of its drop on the answers (0.35), so
+  reading and writing moved together**; the next cut's statistics can use Japanese text written by people
+  (Wikipedia, Aya) without the original's answers.
+- What this does and does not say: "reading" here is predicting the question text token by token, and J's KD
+  windows included the questions (KD covers every position), so the question drop is also direct training on
+  Japanese text like it; it is not a test of understanding. Read plainly: KD on Japanese lowered the loss on all
+  Japanese text by about the same amount (questions 7.5%, answers 10%, early and late answer tokens alike), and
+  that drop did not reach the generated answers (section 27: loops 17 → 11, content 19 → 20). The model after J is
+  still about 2 nats per token from the original on its own answers; a 10% gain on a gap that size does not
+  change what it writes. That supports re-cutting with Japanese in the statistics over more KD.
+- The request phrases (four, repeated through J's training) fell most (-21.5%): memorised, as expected; not read.
+
+## 30. Japanese in the choice of neurons: `mix12ja` against `mix12`, one to one (design written 2026-11-19, before any run; plan from GPT-6.2 Astra, decided here)
+
+Sections 27 and 29: KD on Japanese lowered the loss on all Japanese text by about a tenth and hardly changed what the
+model writes; the model stays about 2 nats a token from the original on its own Japanese answers. The neurons were
+chosen from chat windows (code and math) and, at one eighth, from English general text (6l, 22); no Japanese text
+had a say. Here a small share of Japanese text joins the statistics, the cut keeps its size and shape (9.4B,
+`g128b28160`), and the two cuts get exactly the same KD.
+- **Preview 2 is not touched by this**: it goes out as section 22's `mix12` + KD (Astra and the author agree;
+  sections 27–28 kept nothing). It is built through the Kaggle release notebook (section 14), which the author
+  starts, after Kaggle's weekly reset.
+- **Japanese statistics** (`heal/ja_calib.py`, on the VM): 150 calibration windows of 512 tokens and 40 held-out
+  ones, each half Japanese Wikipedia (articles not among the KD windows' Wikipedia pieces) and half the Aya
+  dataset's Japanese rows (a person's question and a person's answer, in the thinking-off chat format). By section
+  29, text written by people is enough; the original's answers are not used. Nothing from jp4, jp5, jp6 or section
+  27's held-out rows. The statistics come from one pass over the original (`moe/calib_pass.py` on the GPU), as 6l.
+- **Variants** scored in the same pass with no training (KL to the original's own output over the whole
+  vocabulary): `mix12` itself, and `mix12` with the Japanese statistics at 1/32, 1/16 and 1/8 (mix12's at 1 − w),
+  on chat A and B, general H (6l's 40 windows) and the 40 held-out Japanese windows.
+- **Choice** (fixed now): the largest Japanese weight whose chat KL is at most 0.01 above `mix12`'s and general KL at
+  most 5% above it. If at that weight the Japanese KL is not at least 10% below `mix12`'s, nothing is trained and
+  the answer is "Japanese in the statistics does not bring the Japanese back at this size". The chosen variant is
+  `mix12ja`.
+- **KD, the same for both** (section 22's): from wikil-a's LoRA, 2,100 plain windows of 1,024 tokens (section 21's
+  three sources; one new set used by both arms), the same targets, order, rate and steps (263), measured every 66
+  steps on chat A+B, general H and the Japanese held-out windows (targets k = 64). The two runs side by side on one
+  G4. Arm A (`mix12`) also shows how close a rerun of section 22 comes to its 0.1257 / 1.179. Both go to the Mac at
+  their last step.
+- **On the Mac (4-bit; `mix12ja` built from its statistics as `mix12` was)**:
+  - `fix_task/jp6_set.jsonl`: 20 new questions of section 26's four kinds × four directions (80), written now and
+    used for nothing before this. Content graded by hand **blind**: the two arms' answers to each prompt are shown
+    as X and Y in a random order, the key kept apart and opened only after all 160 are graded. Language and loops
+    by `heal/jp_auto.py`.
+  - Facts, both sets (120 + 40 made-up + 10 real).
+  - Only if the rule's points 2–4 hold: the guard (check set, 8,192 cap, code graded on Kaggle) and MMLU-Pro
+    (thinking off, 280), both arms.
+- **Rule**: `mix12ja` replaces `mix12` as the base for what follows if all hold:
+  1. after KD, chat KL at most 0.005 above arm A's and general KL at most 3% above it;
+  2. jp6, the two directions that answer in Japanese (40): content up by at least 4 against arm A, loops not more;
+  3. en→en content not down by more than 1 of 20; the code items (5 per direction) not down in total;
+  4. facts: wrong share of answered not up by more than 0.03, right not down by more than 2;
+  5. guard within 3 of arm A, MMLU-Pro not lower by the paired sign test (p < 0.05).
+  If 1 fails, the Mac checks are skipped. If 2 fails with 1, 3, 4 holding, Japanese at this share of the statistics
+  does not change what the model writes either, and Japanese is left as a known weak point at 9.4B.
+
+### Result so far: the KL part (2026-11-19 17:53; `cache/b30/`)
+
+Before KD (one pass over the original, KL to it over the whole vocabulary; Japanese = the 40 held-out windows):
+
+| variant | chat | general H | Japanese | kept neurons shared with `mix12` |
+|---|---:|---:|---:|---:|
+| `mix12` | 0.1550 | 1.706 | 3.929 | – |
+| Japanese at 1/32 (`mix03`) | 0.1610 | 1.691 | 1.781 (−54.7%) | 96–99% by layer |
+| Japanese at 1/16 | 0.1685 (over the limit) | 1.677 | 1.389 | 93–96% |
+| Japanese at 1/8 | 0.1775 (over the limit) | 1.606 | 1.145 | 87–92% |
+
+- Choice by the fixed rule: 1/32 (`mix03`, 117 experts a layer). Changing 1–4% of the kept neurons halves the
+  Japanese KL before any training: the neurons Japanese needs are few, and the chat-and-English statistics dropped
+  them.
+
+After the same KD (263 steps, last step):
+
+| arm | chat | general H | Japanese |
+|---|---:|---:|---:|
+| A (`mix12`, rerun of section 22) | 0.1260 | 1.178 | 1.973 |
+| B (`mix12ja`) | 0.1288 (+0.0028) | 1.175 (−0.3%) | 1.134 (−42.5%) |
+
+- Arm A reproduces section 22 (0.1257 / 1.179). Rule point 1 holds for B (chat within 0.005, general within 3%).
+  The Japanese gap stays after KD (−42.5%, against section 27's −18.6% from 3M tokens of Japanese KD).
+- Points 2–5 are on the Mac (4-bit build of `mix12ja`, jp6 blind, facts), queued 22:05 (`cache/queue_b30.sh`).
+
+### Result: the Mac part (2026-11-19 23:30; Mac 4-bit, one sample; `cache/jp6/`, `cache/halluc*/g128b_b30*`)
+
+jp6 (80 questions never used before), content graded blind (`cache/jp6/blind_grades_b30.py`; X/Y shuffled per
+question, key opened after all 160 were graded); loops and Chinese marks by `heal/jp_auto.py`:
+
+| | A (`mix12`) | B (`mix12ja`) |
+|---|---:|---:|
+| content, answers in Japanese (ja→ja + en→ja, of 40) | 19.5 | 20.5 (+1) |
+| content ja→en / en→en (of 20) | 9.5 / 13 | 13 / 14 |
+| code items, all directions (of 20) | 12 | 13.5 |
+| loops, answers in Japanese (of 40) | 15 | 7 (sign test p = 0.04) |
+| Chinese marks, answers in Japanese (of 40) | 11 | 0 (p = 0.001) |
+| ja→en answered in English (of 20) | 12 | 16 |
+
+Facts (both sets, 120):
+
+| | right | wrong | abstains | wrong of answered | made-up names described (of 40) |
+|---|---:|---:|---:|---:|---:|
+| section 22's LoRA (Preview 2) | 52 | 40 | 28 | 0.43 | 27 |
+| A | 51 | 43 | 26 | 0.46 | 29 |
+| B | 44 | 54 | 22 | 0.55 | 26 |
+
+- By the rule: 1 holds; **2 fails** (content +1, 4 needed; loops fewer); 3 holds (en→en +1, code +1.5); **4 fails**
+  (wrong share +0.09, right −7). **`mix12ja` does not replace `mix12`.**
+- What it shows all the same: a 1–4% change of the kept neurons removed the Chinese marks entirely and halved the
+  loops in Japanese answers, so the writing is cleaner, but what the answers say is no more often right. With this
+  mix, Japanese came at a cost in facts (right −7), the same direction as section 27's J. That this is a limit of
+  9.4B, or that particular neurons compete, is not shown: one mix, one sample (Astra's note, 11-19 23:40).
+
+## 31. Reasoning only: KD on pairs where one changed condition changes the answer (design written 2026-11-19, before any run; the author's idea)
+
+- Why (the author): if the aim is reasoning alone, keep `mix12` as it is and train on problems where changing one
+  condition changes the answer. A model that reasons follows the change; one that matches a familiar problem gives
+  the old answer. 6h and section 26 A both show answers that ignore what the question says.
+- **Data** (`heal/contrast_data.py`, the original through vLLM on the VM, thinking on, 2 samples each):
+  - math: GSM8K training problems; the original rewrites each with exactly one condition changed so that the
+    answer changes (a small edit: at least 80% of the words the same). Kept if both solutions of the problem give
+    GSM8K's answer, both solutions of the variant agree and differ from it.
+  - code: small Python programs written here from eight templates, each with a one-token variant (a comparison, a
+    range or slice end, // against /, a modulus test, a sort order) whose printed output differs. The outputs come
+    from running the programs (on the VM). Kept if both of the original's answers match the run.
+  - The two members of a pair sit next to each other in the KD windows (`kd_windows.py` keeps a "group" together).
+- **Held out**: 60 math pairs from GSM8K's test split and 60 code pairs from another seed (no program shared with
+  the training ones), only pairs the original gets right twice on both members. On the Mac with thinking on, up to
+  4,096 tokens (`heal/contrast_grade.py`).
+- **Runs** (the same G4 rental as section 30, after it): from section 22's LoRA on `mix12`, 3,000 windows of 1,024
+  tokens, rate and steps as section 28 (375): **C** with half the windows from the pairs and half plain; **ctrl2**
+  all plain (the same plain sources, so C's only difference is the pairs). Side by side. Both measured every 75
+  steps (chat A+B, general H); the last step of each goes to the Mac. Section 22's LoRA is answered too, for
+  reference.
+- **Rule** (fixed now): C is kept if
+  1. its chat KL is at most 0.1287 and its general KL at most 1.214 (section 27's limits);
+  2. on the 120 held-out pairs, pairs with both members right exceed ctrl2's by at least 6, with the exact sign
+     test on the pairs right for one run only at p < 0.05, and pairs answered with the same answer for both
+     members not more than ctrl2's;
+  3. then the guard (check set, 8,192 cap) within 3 of ctrl2 and MMLU-Pro not lower by the paired sign test.
+  If 1 holds and 2 fails, pairs of this kind at this amount do not change how the model follows a changed
+  condition. Math and code are reported apart; the rule reads the two together.
+
+### What follows section 31's result (written 2026-11-19 23:55, before it; plan from GPT-6.2 Astra)
+
+- Caveats on the held-out pairs (checked here): none of the 240 held-out prompts equals a training prompt, but the
+  code pairs come from the same eight templates as the training ones; the variant answers of the math pairs rest on
+  the original agreeing with itself twice, not on a checked label.
+- **If C passes the rule**: before any further training, C against ctrl2 on pairs from rule combinations that no
+  training template uses (`heal/contrast_new.py`, 60 code pairs, labels from running the programs, made now:
+  `cache/b31/new31/held.jsonl`; sort-cut-sum, a nested loop with a break, digit sums, enumerate with parity, zip
+  with a comparison, max by a key, reversed strings, filtering after sorting). Same request as section 31 (thinking
+  on, 4,096 tokens). Read as: pairs both right for C ≥ ctrl2's + 4 with the sign test p < 0.1 → the gain reaches
+  past the training formats; otherwise it is format learning.
+- **If C does not pass**: first the math pairs where C and ctrl2 split (one has both right, the other not) are
+  solved again with the model names hidden, to check the labels; then the failures whose labels hold are given to
+  `mix12` + section 22's LoRA four times each, to separate "solved sometimes" from "the same condition misread all
+  four times". That decides what the next training data should be.
+
+## 35. Whole contrast pairs: problem, working and answer in one window (design written 2026-11-20 01:40, before any run; plan from GPT-6.2 Astra, decided here)
+
+- What Astra found (recounted here with the tokenizer, same numbers): `kd_windows.pack` concatenates rows and cuts
+  every 1,024 tokens, and `kd_targets` scores each window alone, so in section 31's C most pair windows hold the middle
+  of a long thinking trace without its problem; neither the student nor the teacher sees which condition changed.
+  Of section 31's pairs, both members fit one window with the full teacher text for 59 of 790 math and 312 of 795 code
+  pairs; with the teacher's own short final solution (the text after its `</think>`), for 573 and 777. (The same
+  cut hits plain KD: 65% of the reasoning rows are longer than a window.)
+- **S** (one run): section 31's pairs with the short solution as the completion, thinking-off template
+  (`heal/contrast_short.py`); math variants kept only if the original's own one-line Python expression for the
+  variant, run on the VM, gives the agreed answer. Windows: 3,000 of 1,024 as C, half plain (section 21's three
+  sources) and half pairs packed whole (`kd_windows.py --pairs-whole`: no member is cut; the rest of a window is
+  filled with chat text). The original's top-20 targets on these windows; KD from section 22's LoRA, 375 steps, as C.
+  On VM p2 after the Preview 2 build (`heal/gcp_b35.sh`). The plain half is made again by the same recipe, not the
+  same windows as C (C's were deleted with VM b30).
+- Rule (Astra's, fixed now): on section 31's 120 held-out pairs (thinking on, 4,096 tokens) S has at least 6 more pairs
+  with both members right than C, sign test p < 0.05; then the 60 new-combination pairs (`cache/b31/new31`), the
+  check set with the 8,192 cap and the 120 facts must hold (facts: wrong share not up by more than 0.03).
+- Caveat: S's completions have no thinking, and the test asks with thinking on. The held-out pairs are also asked
+  with thinking off (reported, not ruled on).
+
+### Change to sections 31 and 35's evaluation (2026-11-20 02:00, before any of their answers was graded)
+
+- The Mac run of section 31's held-out pairs (4-bit, thinking on, 4,096 tokens) answered about 0.8 questions a
+  minute between Metal resource-limit restarts (12+ hours for the arms), and the Mac froze at 01:07 with Blender next
+  to the MLX server (30 GiB wired; the guard now also watches wired memory and heavy GPU apps). It was stopped with
+  56 of ctrl2's 240 answers, none graded.
+- All arms (Preview 2, C, ctrl2, S) are asked on VM p2 instead, bf16 vLLM, the same request (`heal/gcp_b36.sh`): a
+  padded checkpoint per arm made by swapping the LoRA in Preview 2's padded one (`heal/relora_padded.py`; every arm's
+  LoRA covers the same non-expert linears; the padding experts' router rows are kept). The rules are unchanged.
+
+### Results of sections 31 and 35 (2026-11-20 06:40; VM p2, bf16 vLLM, thinking on, 4,096 tokens; `cache/b36/`, `cache/b35/`)
+
+- Section 35's data (`cache/b35/stats.json`): math 790 pairs, 573 with short solutions that fit, 57 dropped by the
+  expression check, **516 kept**; code 795, **777 kept**. 3,000 windows (1,500 whole pairs). KD S, 375 steps from
+  section 22's LoRA, 49 minutes, no traceback.
+- KL at step 375 (limits 0.1287 / 1.214): C 0.1220 / 1.171, ctrl2 0.1239 / 1.163, S 0.1240 / 1.169. All inside.
+- 120 held-out pairs (60 math, 60 code); pairs with both members right (members right; same answer for both):
+
+  | | math | code | total | same answer both |
+  |---|---:|---:|---:|---:|
+  | Preview 2 (section 22's LoRA) | 31 (82) | 46 (101) | 77 | 3 |
+  | ctrl2 | 35 (88) | 49 (105) | 84 | 3 |
+  | **C** | **44** (102) | 51 (106) | **95** | 1 |
+  | S | 36 (91) | 51 (106) | 87 | 5 |
+
+  - **C against ctrl2**: +11 pairs (rule: ≥ 6), right for one only 19 against 8, **sign test p = 0.052** (rule:
+    < 0.05), same-answer pairs 1 against 3. **C does not pass**, by the test's margin; the gain is almost all math
+    (+9).
+  - **S against C**: −8 pairs, 6 against 14, p = 0.115. **S does not pass** (rule: ≥ C + 6). Whole pairs with the
+    short solution did worse than section 31's packing, not better.
+  - New-combination code pairs (60, reported though C did not pass): Preview 2 42, ctrl2 44, C 46, S 43; C against
+    ctrl2 5 against 3 (p = 0.73). No sign that the code gain reaches new formats; code was near its ceiling anyway.
+  - Thinking off (Preview 2 and S, reported only): math 51 and 50 of 60, code 53 and 54. **With thinking off both
+    solve far more pairs than with thinking on at 4,096 tokens** (Preview 2 math 51 against 31), where 15 of
+    Preview 2's math answers had no \boxed{} (thinking not finished). The same long-thinking problem as section 34.
+- What it means: training on contrast pairs moved math in the right direction (C's +9 math pairs) but not past the
+  rule, and the short-solution version (Astra's plan) did not help. Much of what these pairs measure with thinking
+  on is whether the thinking ends in time, which neither run fixed.
+
+### Section 31's follow-up for a C failure (2026-11-20 07:03; VM p2, then deleted; `heal/contrast_followup.py`, `cache/b36/fu_*`)
+
+- Members checked: both members of the 19 math pairs C and ctrl2 split, and of the 29 math pairs Preview 2 did not
+  get both right (35 pairs, 70 members). The original solved each four times (thinking on, 8,192 tokens, no model
+  answer shown); a label holds at 3 of 4. A first pass read answers differently from the grader (it needed
+  `</think>`), so it was run again with the grader's reading and each sample's stop reason; only the second pass is
+  reported.
+- **Labels hold for 67 of 70.** The three that fail are members whose stored label is empty (`math-25-b`, `-36-b`,
+  `-55-b`; the original runs to 8,192 tokens on them). **Five held-out math members have empty labels** (also
+  `-44-b`, `-49-b`), so those five pairs can never count as right, for every arm alike. This was a defect in
+  `contrast_data.py`'s held-out filter, found here.
+- Of the 19 split pairs, 18 have both labels holding: C right alone on 14, ctrl2 on 4 (sign test p = 0.031). This is
+  after the fact, on a subset, and does not change the rule's reading (C did not pass at p = 0.052).
+- **Preview 2's 36 wrong members (labels holding), four more tries each: 8 right every time, 19 sometimes, 9 never.
+  Of the 74 wrong tries, 73 ran to the 4,096-token limit**; one finished with a wrong answer. The 9 "never" are all
+  cut at the limit in every try.
+- **What that decides** (the purpose written before): the failures are not a changed condition misread; they are
+  thinking that does not end. The next training data should not be more contrast pairs. It should target the
+  thinking's length and ending, the same problem as section 34; section 37 says which step caused it.
+
+## 32. Advice from Gemini 4 Neon (2026-11-19; the author's request; `cache/advice/gemini4neon_1119_*.md`)
+
+The state of sections 21–31 was sent through the Antigravity CLI (`agy -p`, `gemini-4-neon-xhigh`, the highest
+effort that model offers; read-only, in an empty folder; no names or accounts in the brief). Its answer, checked
+against what has been done here:
+- **Already done** (it assumed otherwise): the teacher's top-k is computed offline by vLLM before training, so the
+  teacher never shares the GPU with the student; the KD loss uses the student's full-vocabulary log-softmax with a
+  tail bucket; dropped experts leave with their router rows (116 kept experts a layer, no empty slots); abstention
+  trained on the cut model's own answers ("known" at 4–5 of 5 right, "not known" at 0–1) is sections 6m–6n's
+  honest1/honest2 (wrong share 0.76 → 0.74, at a cost on the benchmark questions).
+- **New here and worth a test** (in the order taken up):
+  1. Closed-form reconstruction of each kept expert's `down_proj` after the cut (ridge least squares from the kept
+     neurons' activations to the original expert's output); no training, one pass.
+  2. bf16 against 4-bit generation on the Japanese set: every generated-answer check so far is Mac 4-bit (section
+     29's teacher-forced numbers agree with the G4's, but loops are a generation effect).
+  3. Layer budgets and the aggregation of importance (per-domain normalisation with a max, or a high percentile,
+     instead of a weighted sum): 6n designed two of these (`mix25x`, `mix25p`) and its Mac pass stopped at layer 12,
+     so they were never measured.
+  4. Training the routed experts themselves on more tokens (section 26 B's down_proj LoRA was still pulling away
+     when it ended).
+  5. Later: on-policy KD (JSD or reverse KL on the student's own Japanese answers) against loops.
+- On the running runs: for section 30, read the KL **before** KD (the pass gives it) as well as after; the KD both
+  arms get has little Japanese (section 21's Wikipedia quarter), which may hide what the kept neurons could do. On
+  section 31: token-level KD spends most of its signal on the tokens a pair shares. Both noted; the rules stand.
+- Not taken as given: its "KL below 0.4–0.5 for generation to hold" and capacity arguments are guesses.
+- Correction (Astra, same evening): item 1 was already measured. Section 16's `elsq` refits every kept expert's
+  `down` by least squares from its kept neurons, and gained 1.9% [+0.8, +2.9] in chat KL; it is not taken up again.
+  Item 2 goes first (section 33).
+
+## 33. Japanese answers in bf16 against Mac 4-bit (design written 2026-11-19 22:10, before any run; plan from GPT-6.2 Astra)
+
+- Why: every Japanese generation check so far (jp4–jp6, sections 26–30) ran on the Mac in 4-bit MLX. Loops, Chinese
+  words and made-up words are generation effects, and 4-bit noise could add to them. Section 9b compared bf16 with
+  4-bit on math and code only. If 4-bit is a large part of the Japanese breakage, the Japanese checks must move to
+  bf16 (or 8-bit) and the model card must say so; if not, the breakage is in the weights and the 4-bit numbers stand.
+- Model: Preview 2's candidate only, `mix12` + section 22's LoRA (`cache/swap22/kd_mix12/lora_best.pt`).
+  - bf16: the LoRA folded into the padded checkpoint (`pad_uneven.py`, stops on any padding-expert pick), vLLM on the
+    G4 (`heal/gcp_b33.sh`, on VM b30 after section 31's KD).
+  - 4-bit: the Mac's MLX build with the `mix12kd` adapter, as before.
+- Questions: jp5 and jp6 (80 each: 20 questions × 4 directions). Same request as the Mac: thinking off, temperature
+  0.6, top-p 0.95, top-k 20, no seed, 1,024 tokens. bf16: 4 samples a question. 4-bit: jp5's existing answers plus one
+  new sample, and two samples of jp6.
+- Measured (`heal/jp_auto.py`), on the answers asked in Japanese output (jaja + enja, 40 a set): looping, the
+  language right, Chinese marks (simplified-only characters, 所以, 因此), cut at the limit; and the number checks.
+  Per question the rate over its samples; bf16 against 4-bit paired by question over both sets (80 questions), sign
+  test on the questions where the rates differ.
+- Blind content grading: jp6, the Japanese-output questions, first sample of each arm, shown as X/Y in a shuffled
+  order per question with the key kept apart (as section 30).
+- Reading, fixed now:
+  - "4-bit matters for Japanese" = loops lower in bf16 by at least 10 points (of the Japanese-output answers) with
+    sign test p < 0.05, or blind content higher by at least 4 points. Then: the 8-bit MLX build is checked the same
+    way on the Mac, Japanese checks from here run in bf16 or the lowest bit width that matches it, and the card
+    says which.
+  - Otherwise the Japanese breakage is taken to be in the weights; earlier 4-bit results stand.
+  - English-output answers (enen, jaen) are reported too, not ruled on.
+
+### First look (2026-11-19 22:45; jp5 only; `cache/b33/`, VM b30 deleted)
+
+- The padded bf16 checkpoint: 477 dummy experts in 38 layers, 0 dummy picks on 120 held-out sequences. vLLM answered
+  both sets four times in 3 minutes.
+- jp5, Japanese-output questions (40), bf16 4 samples against the Mac's existing 4-bit sample:
+
+  | | loop | Chinese marks | wrong language | cut at 1,024 | number check missed |
+  |---|---:|---:|---:|---:|---:|
+  | bf16 (vLLM) | 44.4% | 39.4% | 0.6% | 48.8% | 29.7% |
+  | 4-bit (MLX) | 42.5% | 52.5% | 0.0% | 37.5% | 12.5% |
+
+  Loops +1.9 points in bf16 (higher on 9 questions, lower on 16; p = 0.23); Chinese marks −13 points (p = 0.27).
+  The English-output answers loop no less in bf16 either (15.6% against 5.0%).
+- So far bf16 does not loop less: the Japanese breakage looks like it is in the weights, not the 4-bit build. The
+  ruling waits for the Mac's extra 4-bit samples (jp5 one more, jp6 two; `cache/queue_b33.sh`) and jp6's blind
+  content grading.
+
+### Result (2026-11-20 00:12; bf16 4 samples, 4-bit 2 samples, jp5 + jp6 = 80 questions a side; `heal/jp_quant.py`)
+
+| answers asked in Japanese (80 questions) | bf16 (vLLM) | 4-bit (MLX) | bf16 − 4-bit, sign test |
+|---|---:|---:|---|
+| loop | 44.1% | 41.9% | +2.2 points, p = 1.0 |
+| Chinese marks | 34.1% | 35.0% | −0.9, p = 0.89 |
+| cut at 1,024 tokens | 50.0% | 43.1% | +6.9, p = 0.017 |
+| blind content, jp6 first sample (of 40) | 20.5 | 18.5 | +2; higher on 6 questions, lower on 3 |
+
+- English-output answers: bf16 loops more (15.6% vs 10.6%, p = 0.03) and answers ja→en in Japanese more often
+  (32.8% vs 22.5% wrong language, p < 0.001).
+- **By the rule: 4-bit does not matter for Japanese** (loops not lower in bf16; content +2, 4 needed). The Japanese
+  breakage is in the weights; the earlier 4-bit Japanese results stand. The 8-bit check is not run.
+- bf16 here is vLLM and 4-bit is MLX, so precision and engine change together; where bf16 is worse (cut at the limit,
+  wrong language in English answers), engine or sampling differences may be the cause, not shown here.
+
+## 34. The Preview 2 build on the G4 (design written 2026-11-19 23:40, before any run; the author: "G4で今夜ビルドして")
+
+- What goes out (unchanged since section 28): `mix12` (`g128b28160`, 116 experts a layer, built from
+  `cache/swap22/stats_mix12.npz`) with section 22's LoRA (`cache/swap22/kd_mix12/lora_best.pt`, step 263) folded in.
+  Sections 30, 31 and 33 do not change it.
+- One G4 rental (`heal/gcp_p2.sh`, VM `p2`), each step skipped when done:
+  1. build `mix12` (bf16, uneven) from the original, as every run since section 22;
+  2. fold the LoRA into a copy (`heal/fold_lora_uneven.py`), then the release check of section 14: the folded model's
+     KL on chat A+B (`heal_train.eval_kl`) must be within 0.01 of the run's own 0.1257, or nothing goes further;
+  3. the padded checkpoint (`moe/pad_uneven.py`, stops on any padding-expert pick);
+  4. GGUF Q4_K_M from the padded checkpoint with llama.cpp's converter, and the same three CPU prompts as Preview 1;
+  5. the card's bf16 benchmarks, the same sets and settings as Preview 1 (section 15: AIME 2026 ×3, MMLU-Pro 280,
+     LiveCodeBench v6 175, IFEval 541; thinking on, 32,768 tokens, the usual sampling, no seed), all sent at once
+     to one vLLM server (`bench/colab_ext_par.sh`'s way), graded on the VM (LiveCodeBench runs model code there).
+- Upload: the author logs in to Hugging Face on the VM and runs `p2_upload.sh`, which opens pull requests on the two
+  existing repositories (uneven + GGUF + card on the main one, padded on `-padded`). Merging is the author's.
+- Card (`release/MODEL_CARD.md`, drafted here, checked by the author): Preview 2's numbers next to Preview 1's;
+  Japanese still marked broken (sections 27, 30, 33); the 4-bit note narrowed by section 33.
+
+### Result (2026-11-20 03:55; VM `p2`; `cache/p2/`)
+
+- Build: release KL 0.1258 (run 0.1257); padded, 0 padding-expert picks on 39,879 held-out tokens; GGUF Q4_K_M
+  11,373,058,048 bytes, the three CPU prompts right. Uploaded by the author as pull requests (main #3, padded #3),
+  not merged.
+- The VM's grade step failed (the name came after the options, which argparse refused); graded again by hand on the
+  VM, and the script fixed. Per-question comparison with Preview 1's 11-15 answers: `bench/paired_bench.py` (on the
+  VM; `cache/p2/paired_p2_vs_p1.json`). Preview 1's IFEval regrades to 360 here (362 on the card; checker version).
+
+  | bf16, thinking on, 32k | Preview 2 | Preview 1 | right in P2 only / P1 only | sign p | cut at 32k (P2 / P1) |
+  |---|---:|---:|---:|---:|---:|
+  | AIME 2026 (30 ×3) | 18.0 | 20.7 | 5 / 13 | 0.10 | 33 / 27 of 90 |
+  | MMLU-Pro 280 | 141 | 144 | 25 / 28 | 0.78 | 59 / 41 |
+  | LiveCodeBench v6 175 | **50** | 68 | 7 / 25 | **0.002** | 122 / 95 |
+  | IFEval 541 | 341 | 360 | 56 / 75 | 0.12 | 191 / 135 |
+
+- **Long thinking got worse.** Preview 2 runs to the 32k limit more often on every set. On LiveCodeBench it hit the
+  limit on 35 problems Preview 1 finished, against 8 the other way. Only LiveCodeBench's loss is clear by itself;
+  AIME and IFEval lean the same way.
+- This was not seen before the release, because every check that chose Preview 2 used thinking off or an 8,192-token
+  thinking cap (MMLU-Pro 121/123 and IFEval 364/366 thinking off; the check set 44/44 at 8,192).
+- Not separated: the cut (general text in the neuron choice) or section 22's distillation (1,024-token windows,
+  mostly short) could cause it. vLLM was 0.34.0 here; Preview 1's run did not record its version.
+- What this changes: the card no longer says reasoning is level with Preview 1. It says facts went up and long
+  thinking-on code went down, and it advises capping thinking at about 8,192 tokens. Whether Preview 2 still
+  replaces Preview 1 is the author's call (the pull requests are not merged).
+
+## 37. Which step made long thinking worse: the cut or the distillation? (design written 2026-11-20 04:10, before any run)
+
+- Section 34 found Preview 2 running to the 32k limit more often than Preview 1 (LiveCodeBench 122 of 175 against
+  95; score 50 against 68). Preview 2 differs from Preview 1 in two steps: the cut (`mix12`: 1/8 general text in the
+  neuron choice) and section 22's KD (1,024-token windows, from Preview 1's LoRA). Two arms take one step each:
+  - **K** (KD only): Preview 1's cut with section 21's KD LoRA (`cache/kd21_gpu/lora_best.pt`, the same KD on
+    Preview 1's cut);
+  - **M** (cut only): `mix12` with Preview 1's own LoRA, no KD (section 22's step 0).
+- Each is built, folded and padded as in section 34 and asked LiveCodeBench v6 (175) and AIME 2026 (×3), bf16,
+  thinking on, 32,768 tokens, the same settings and `eval_chat` call; graded and compared per question with
+  `bench/paired_bench.py` against Preview 1's and Preview 2's answers. Next G4 rental, batched with other work.
+- **Reading, fixed now:** an arm "carries" the loss when its LiveCodeBench cut count is at least Preview 1's + 15
+  (110) and its per-question sign test against Preview 1 gives p < 0.05. Only K carries it: the distillation (fix
+  the windows: longer, or whole reasoning traces). Only M: the cut (the general text takes neurons that long
+  reasoning needs; try a smaller general share). Both or neither: reported as not separated; neither means the two
+  steps only hurt together.
+- Not a benchmark chase: the choice of any later preview still goes through the facts, the check set and the KL,
+  with this as one more check (thinking on, 32k, LiveCodeBench cut count) written into the rules from now on.
+
 ## 6k. Does the cut model work as an agent? (design written 2026-11-13, before any run; `heal/agent_probe.py`)
 
 - Why (the author's question): a local agent app drives a model through tool calls, many turns in a row. Answering a

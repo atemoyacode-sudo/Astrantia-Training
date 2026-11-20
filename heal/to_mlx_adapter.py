@@ -32,6 +32,8 @@ def main() -> None:
     sd = torch.load(args.lora, map_location="cpu")
     pairs, experts = {}, {}
     for name, t in sd.items():
+        if ".mlp.experts.lora_" in name:  # README 26 B: folded into the build by fold_expert_lora_mlx.py instead
+            continue
         m = re.fullmatch(r"model\.layers\.(\d+)\.(.+)\.(A|B)", name)
         e = re.fullmatch(r"expert_lora\.(\d+)\.(A1|B1|A2|B2)", name)
         assert m or e, f"unexpected parameter {name}"

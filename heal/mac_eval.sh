@@ -15,7 +15,7 @@ SERVER=("$X/heal/mlx_safe_server.py"); [ -n "${DRY:-}" ] && SERVER=("$X/heal/mlx
 CACHE=(--prompt-cache-size 2 --prompt-cache-bytes 1073741824)  # every question is new: a big prompt cache only costs memory
 AD=(); [ -n "${ADAPTER:-}" ] && AD=(--adapter-path "$ADAPTER")
 echo "== start $OUT ($(date '+%m-%d %H:%M'))"
-SRV=; trap '[ -n "$SRV" ] && kill $SRV 2>/dev/null' EXIT  # eval_chat.py failing must not leave the server running
+SRV=; trap '[ -n "$SRV" ] && kill $SRV 2>/dev/null || true' EXIT  # eval_chat.py failing must not leave the server running
 for attempt in $(seq 1 30); do
   bash "$X/heal/mem_wait.sh"  # do not start a server while memory is short: the guard would kill it at once
   $PY "${SERVER[@]}" --model "$MODEL" ${AD[@]+"${AD[@]}"} --port "${PORT:-8080}" --max-tokens 16000 "${CACHE[@]}" >> "$OUT/server.log" 2>&1 &

@@ -68,7 +68,9 @@ def main() -> None:
     counts = {s: [] for s in specs}
     kept = {s: [] for s in specs}
 
-    rest = {k: v for k, v in mx.load(str(base / "model.safetensors")).items() if not any(p in k for p in EXPERT_PARTS)}
+    # a base built by this script keeps the non-expert weights in model-rest.safetensors (11-18)
+    rest_file = base / "model.safetensors" if (base / "model.safetensors").exists() else base / "model-rest.safetensors"
+    rest = {k: v for k, v in mx.load(str(rest_file)).items() if not any(p in k for p in EXPERT_PARTS)}
     for s, out in outs.items():
         out.mkdir(parents=True, exist_ok=True)
         mx.save_safetensors(str(out / "model-rest.safetensors"), rest, metadata={"format": "mlx"})

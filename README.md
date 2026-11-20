@@ -4,6 +4,12 @@ Code for **Sharpen-Qwen-3.5-9B-A2.6B-Preview** (code name Astrantia), a research
 Qwen3.5-35B-A3B cut to 9.4B parameters (−73%), still an MoE with about 2.6B parameters active per token, healed with
 about 15M tokens of LoRA training. Not an official Qwen model.
 
+**Preview 2** (2026-11) has the same size and shape. Only the choice of the kept neurons changed (their importance is
+now measured on chat text and, at 1/8, general-knowledge text, which swaps 8.2% of them), followed by token-level
+distillation to the original's top-20 log-probabilities. Short facts right went from 19 to 52 of 120 with the same 40
+wrong. With thinking off or capped at 8,192 tokens the other scores are level with Preview 1; with long thinking
+(32k) it loops more and LiveCodeBench fell from 68 to 50. See section 7 below.
+
 The question behind it: **can a model of any chosen size be made from a large one by cutting it and healing it a
 little?** And when it can, **what gets weaker?** The weights, the benchmark numbers and the known weak points are on
 the model card: [Takenoko12345678/Sharpen-Qwen-3.5-9B-A2.6B-Preview](https://huggingface.co/Takenoko12345678/Sharpen-Qwen-3.5-9B-A2.6B-Preview)
@@ -14,12 +20,13 @@ experiments, with the training data in one file. The weights are on Hugging Face
 
 ## Results in one table (bf16, thinking on, up to 32,768 tokens, one sample per question)
 
-| | Astrantia (9.4B) | NeoHorse-1-9B | Qwen3.5-9B |
-|---|---:|---:|---:|
-| AIME 2026 (30 problems, mean of 3 samples) | 20.7 | 20.3 | 22.3 |
-| MMLU-Pro (280 of 12,032: 20 per subject) | 144 | 221 | 226 |
-| LiveCodeBench v6 (the 175 problems added in v6) | 68 | 96 | 87 |
-| IFEval (541, strict) | 362 | | |
+| | Preview 2 (9.4B) | Preview 1 (9.4B) | NeoHorse-1-9B | Qwen3.5-9B |
+|---|---:|---:|---:|---:|
+| AIME 2026 (30 problems, mean of 3 samples) | 18.0 | 20.7 | 20.3 | 22.3 |
+| MMLU-Pro (280 of 12,032: 20 per subject) | 141 | 144 | 221 | 226 |
+| LiveCodeBench v6 (the 175 problems added in v6) | 50 | 68 | 96 | 87 |
+| IFEval (541, strict) | 341 | 362 | | |
+| Short facts right / wrong (120; Mac 4-bit, thinking off) | 52 / 40 | 19 / 40 | | |
 
 Reduced sets, one sample each: see the model card for what that means. The 280 MMLU-Pro questions were also used
 (thinking off) to choose among our own runs, so they are not fresh for Astrantia.
@@ -87,9 +94,39 @@ Every step was designed and given its pass/fail rule before it ran. The numbers 
 - `heal/think_cap.py`: the same answers with thinking capped (default 8,192 tokens), then finished by the model.
 - `bench/ext_bench.py`: AIME 2026, MMLU-Pro, LiveCodeBench v6 and IFEval (`make` builds the sets, `grade` grades).
   `bench/colab_ext2.sh`, `bench/colab_ext_par.sh`: the G4 runs (vLLM, bf16).
+  `bench/paired_bench.py`: two answer sets compared question by question (right in one only, sign test, answers cut
+  at the token limit); LiveCodeBench runs the model's code, so on a disposable VM.
 - `heal/halluc_probe.py` (made-up names and short facts; `fix_task/halluc_set*.jsonl`), `bench/lang_probe.py`
   (answers in the language asked), `fix_task/ja_sample.jsonl` (two Japanese prompts).
 - `heal/mac_eval.sh`, `heal/mlx_safe_server.py`, `heal/mem_guard.sh`: evaluation on a Mac with a memory guard.
+
+### 7. Preview 2: general text in the choice of neurons, then token-level KD
+
+- `heal/general_text.py`: Qwen3.5-9B writes English general-knowledge text (people, places, events, science, daily
+  life), kept apart from every probe set.
+- `moe/calib_pass.py`: one pass of the original over those windows gives general statistics in the same form as
+  `stats.npz`; `moe/mix_stats.py --chat stats.npz --general <general stats> --w 0.125` mixes them (7/8 chat, 1/8
+  general), and `moe/build_shape.py ... --from-stats <mix>` cuts `g128b28160` from the mix (`mix12`). At this weight
+  8.2% of the kept neurons differ from Preview 1's cut; 104–128 experts are kept per layer (116 on average).
+- `heal/kd_windows.py`: 2,100 windows of 1,024 tokens from the UltraChat regeneration, the original's reasoning
+  traces and Wikipedia; `heal/kd_targets.py`: the original's top-20 log-probabilities on them (vLLM
+  `prompt_logprobs`, computed once before training); `heal/kd_train.py`: token-level KD from Preview 1's LoRA
+  (rank 16; the student's full-vocabulary log-softmax with the rest of the teacher's mass as one tail bucket),
+  263 steps. [one GCP G4]
+- Held-out KL to the original, Preview 1 → Preview 2: chat 0.143 → 0.126, general text 1.60 → 1.18. The same KD on
+  Preview 1's cut took general text only to 1.56.
+- Export as in section 5 (fold, KL check within 0.01 of the run's 0.1257: 0.1258; padded checkpoint with 0 dummy
+  picks; GGUF Q4_K_M).
+- **Long thinking got worse** (research log, section 34). With thinking on to 32k, Preview 2 hits the limit more
+  often (LiveCodeBench 122 of 175 against 95). Problems solved by only one of the two: LiveCodeBench 7 against 25
+  (sign test p = 0.002); AIME 5 against 13 and IFEval 56 against 75 lean the same way; MMLU-Pro is level. Every
+  check that chose Preview 2 used thinking off or an 8,192-token cap, so this was found only after the build. The
+  cause (the new cut or the KD) is not separated.
+- Tried after this and not kept (the research log, sections 23–30): wider shared experts, more KD, a down_proj LoRA
+  on the routed experts, Japanese KD, KD on pairs of real and made-up names, and Japanese text in the choice of
+  neurons, and KD on pairs of problems where one changed condition changes the answer (section 31: +11 pairs with
+  both members right, mostly math, sign test p = 0.052 against the rule's 0.05; the same pairs with the teacher's short
+  solution, section 35, did worse).
 
 ## Data
 

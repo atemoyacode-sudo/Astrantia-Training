@@ -91,6 +91,53 @@ class _RaggedDown(torch.autograd.Function):
         return gh, gd, None
 
 
+class _RaggedB(torch.autograd.Function):
+    """z (S, r), sorted by expert, times each expert's own B[e] (H, r) -> (S, H) (README 26 B: the down_proj LoRA)."""
+
+    @staticmethod
+    def forward(ctx, z, b, egroups):
+        ctx.egroups = egroups
+        ctx.save_for_backward(z, b)
+        out = z.new_zeros(z.shape[0], b.shape[1])
+        for s, e, j in egroups:
+            torch.mm(z[s:e], b[j].T, out=out[s:e])
+        return out
+
+    @staticmethod
+    def backward(ctx, g):
+        z, b = ctx.saved_tensors
+        gz = torch.zeros_like(z) if ctx.needs_input_grad[0] else None
+        gb = torch.zeros_like(b) if ctx.needs_input_grad[1] else None
+        for s, e, j in ctx.egroups:
+            if gz is not None:
+                torch.mm(g[s:e], b[j], out=gz[s:e])
+            if gb is not None:
+                torch.mm(g[s:e].T, z[s:e], out=gb[j])
+        return gz, gb, None
+
+
+def add_down_lora(experts: "RaggedExperts", r: int, alpha: float) -> list[nn.Parameter]:
+    """README 26 B: a rank-r update on every kept expert's down_proj, down_e += (alpha / r) * B[e] @ A_e.
+    A is stored like `down` (r, sum w: expert e's columns at offset[e]), B as (E, H, r); B starts at zero, so the
+    model is unchanged at the start. Router, widths and gate_up stay fixed. fold_down_lora() writes it into `down`."""
+    dev = experts.down.device
+    h = experts.down.shape[0]
+    a = torch.cat([torch.randn(r, w, device=dev) / w ** 0.5 for w in experts.widths], dim=1)
+    experts.lora_A = nn.Parameter(a)
+    experts.lora_B = nn.Parameter(torch.zeros(experts.num_experts, h, r, device=dev))
+    experts.lora_scale = alpha / r
+    return [experts.lora_A, experts.lora_B]
+
+
+def down_lora_delta(a: torch.Tensor, b: torch.Tensor, widths: list[int], scale: float) -> torch.Tensor:
+    """The (H, sum w) change to `down` that a down_proj LoRA stands for."""
+    out, o = [], 0
+    for j, w in enumerate(widths):
+        out.append(b[j].float() @ a[:, o : o + w].float() * scale)
+        o += w
+    return torch.cat(out, dim=1)
+
+
 class RaggedExperts(nn.Module):
     """Drop-in for Qwen3_5MoeExperts on two flat tensors. `impl`: "grouped" (default) sorts the (token, expert) pairs
     by expert once and runs each expert on a contiguous slice, like transformers' grouped experts forward; "loop" is
@@ -123,7 +170,16 @@ class RaggedExperts(nn.Module):
                 start = end
         x = hidden_states[perm // k].to(self.gate_up.dtype)
         gate, up = _RaggedUp.apply(x, self.gate_up, groups, self.wmax).chunk(2, dim=-1)
-        y = _RaggedDown.apply(self.act_fn(gate) * up, self.down, groups)
+        h = self.act_fn(gate) * up
+        y = _RaggedDown.apply(h, self.down, groups)
+        if getattr(self, "lora_A", None) is not None:  # README 26 B
+            egroups, start = [], 0
+            for e, end in enumerate(ends):
+                if end > start:
+                    egroups.append((start, end, e))
+                    start = end
+            z = _RaggedDown.apply(h, self.lora_A.to(h.dtype), groups)
+            y = y + _RaggedB.apply(z, self.lora_B.to(h.dtype), egroups) * self.lora_scale
         y = y * top_k_weights.reshape(-1)[perm, None]
         inv = torch.empty_like(perm)
         inv[perm] = torch.arange(perm.numel(), device=perm.device)
@@ -138,7 +194,10 @@ class RaggedExperts(nn.Module):
             o, w = self.offsets[e], self.widths[e]
             top_k_pos, token_idx = torch.where(mask[e])
             gate, up = F.linear(hidden_states[token_idx], self.gate_up[2 * o : 2 * o + 2 * w]).chunk(2, dim=-1)
-            y = F.linear(self.act_fn(gate) * up, self.down[:, o : o + w])
+            h = self.act_fn(gate) * up
+            y = F.linear(h, self.down[:, o : o + w])
+            if getattr(self, "lora_A", None) is not None:  # README 26 B
+                y = y + F.linear(F.linear(h, self.lora_A[:, o : o + w].to(h.dtype)), self.lora_B[e].to(h.dtype)) * self.lora_scale
             out.index_add_(0, token_idx, (y * top_k_weights[token_idx, top_k_pos, None]).to(out.dtype))
         return out
 
